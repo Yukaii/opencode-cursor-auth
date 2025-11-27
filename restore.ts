@@ -194,18 +194,22 @@ async function processFile(inputFile: string): Promise<{ webpack: number; concat
 }
 
 async function saveModule(originalPath: string, content: string) {
-  // Clean up path - remove leading ../ or ./
+  // Clean up path - remove all leading relative path segments
   let cleanPath = originalPath;
   
-  // Remove leading relative path segments
-  cleanPath = cleanPath.replace(/^(\.\.\/)+/, "");
-  if (cleanPath.startsWith("./")) {
-    cleanPath = cleanPath.substring(2);
+  // Remove all leading ../ and ./ segments
+  while (cleanPath.startsWith("../") || cleanPath.startsWith("./")) {
+    if (cleanPath.startsWith("../")) {
+      cleanPath = cleanPath.substring(3);
+    } else if (cleanPath.startsWith("./")) {
+      cleanPath = cleanPath.substring(2);
+    }
   }
   
-  // Handle paths starting with ../something (like ../cli-credentials)
-  if (cleanPath.startsWith("../")) {
-    cleanPath = cleanPath.substring(3);
+  // Skip if path is empty or invalid after cleaning
+  if (!cleanPath || cleanPath === "/" || cleanPath.startsWith("/")) {
+    console.log(`  Skipping invalid path: ${originalPath}`);
+    return;
   }
   
   const fullPath = join(OUTPUT_DIR, cleanPath);
