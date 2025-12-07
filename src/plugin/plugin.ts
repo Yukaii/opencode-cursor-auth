@@ -3,7 +3,7 @@
  *
  * An OpenCode plugin that provides OAuth authentication for Cursor's AI backend,
  * following the architecture established by opencode-gemini-auth.
- * 
+ *
  * This plugin starts a local OpenAI-compatible server that proxies requests
  * to Cursor's Agent API, enabling OpenCode to use Cursor's models.
  */
@@ -160,17 +160,17 @@ function generateId(): string {
 function messagesToPrompt(messages: OpenAIMessage[]): string {
   const userMessages = messages.filter(m => m.role === "user");
   const systemMessages = messages.filter(m => m.role === "system");
-  
+
   let prompt = "";
-  
+
   if (systemMessages.length > 0) {
     prompt += systemMessages.map(m => m.content).join("\n") + "\n\n";
   }
-  
+
   if (userMessages.length > 0) {
     prompt += userMessages[userMessages.length - 1]?.content ?? "";
   }
-  
+
   return prompt;
 }
 
@@ -212,14 +212,14 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   const model = body.model ?? "auto";
   const prompt = messagesToPrompt(body.messages);
   const stream = body.stream ?? false;
-  
+
   const client = createAgentServiceClient(currentAccessToken);
   const completionId = generateId();
   const created = Math.floor(Date.now() / 1000);
 
   if (stream) {
     const encoder = new TextEncoder();
-    
+
     const readable = new ReadableStream({
       async start(controller) {
         try {
@@ -231,7 +231,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
             model,
             choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
           })));
-          
+
           // Stream content
           for await (const chunk of client.chatStream({ message: prompt, model, mode: AgentMode.AGENT })) {
             if (chunk.type === "text" || chunk.type === "token") {
@@ -251,7 +251,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
               break;
             }
           }
-          
+
           // Send final chunk
           controller.enqueue(encoder.encode(createSSEChunk({
             id: completionId,
@@ -260,7 +260,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
             model,
             choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
           })));
-          
+
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
           controller.close();
         } catch (err: any) {
@@ -268,7 +268,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
         }
       },
     });
-    
+
     return new Response(readable, {
       headers: {
         "Content-Type": "text/event-stream",
@@ -280,7 +280,7 @@ async function handleChatCompletions(req: Request): Promise<Response> {
   } else {
     try {
       const content = await client.chat({ message: prompt, model, mode: AgentMode.AGENT });
-      
+
       return new Response(JSON.stringify({
         id: completionId,
         object: "chat.completion",
@@ -316,7 +316,7 @@ async function handleModels(): Promise<Response> {
   try {
     const cursorClient = new CursorClient(currentAccessToken);
     const models = await listCursorModels(cursorClient);
-    
+
     const openaiModels = models.map(m => {
       let owned_by = "cursor";
       const lowerName = (m.displayName ?? "").toLowerCase();
@@ -329,7 +329,7 @@ async function handleModels(): Promise<Response> {
       } else if (lowerName.includes("grok")) {
         owned_by = "xai";
       }
-      
+
       return {
         id: m.displayModelId || m.modelId,
         object: "model",
@@ -337,7 +337,7 @@ async function handleModels(): Promise<Response> {
         owned_by,
       };
     });
-    
+
     return new Response(JSON.stringify({
       object: "list",
       data: openaiModels,
@@ -369,8 +369,11 @@ function handleCORS(): Response {
  */
 function startProxyServer(): void {
   if (proxyServer) {
-    return; // Already running
+    console.log("[Cursor Plugin] Proxy server already running on port", CURSOR_PROXY_PORT);
+    return;
   }
+
+  console.log("[Cursor Plugin] Starting proxy server on port", CURSOR_PROXY_PORT);
 
   try {
     proxyServer = Bun.serve({
@@ -378,6 +381,8 @@ function startProxyServer(): void {
       async fetch(req) {
         const url = new URL(req.url);
         const method = req.method;
+
+        console.log(`[Cursor Proxy] ${method} ${url.pathname}`);
 
         if (method === "OPTIONS") {
           return handleCORS();
@@ -392,7 +397,7 @@ function startProxyServer(): void {
         }
 
         if (url.pathname === "/health" || url.pathname === "/") {
-          return new Response(JSON.stringify({ status: "ok" }), {
+          return new Response(JSON.stringify({ status: "ok", port: CURSOR_PROXY_PORT }), {
             headers: { "Content-Type": "application/json" },
           });
         }
@@ -400,6 +405,7 @@ function startProxyServer(): void {
         return createErrorResponse(`Unknown endpoint: ${method} ${url.pathname}`, "not_found", 404);
       },
     });
+    console.log("[Cursor Plugin] Proxy server started successfully on port", CURSOR_PROXY_PORT);
   } catch (error) {
     console.error("[Cursor Plugin] Failed to start proxy server:", error);
   }
@@ -450,23 +456,32 @@ export const CursorOAuthPlugin = async ({
       getAuth: GetAuth,
       provider: Provider
     ): Promise<LoaderResult | null> => {
+      console.log("[Cursor Plugin] Loader called");
       const auth = await getAuth();
 
       if (!isOAuthAuth(auth)) {
+        console.log("[Cursor Plugin] No OAuth auth found, returning null");
         return null;
       }
+
+      console.log("[Cursor Plugin] OAuth auth found, checking token expiry");
 
       // Refresh token if needed
       let authRecord = auth;
       if (accessTokenExpired(authRecord)) {
+        console.log("[Cursor Plugin] Token expired, refreshing...");
         const refreshed = await refreshCursorAccessToken(authRecord, client);
         if (refreshed) {
           authRecord = refreshed;
+          console.log("[Cursor Plugin] Token refreshed successfully");
+        } else {
+          console.log("[Cursor Plugin] Token refresh failed");
         }
       }
 
       // Update the current access token for the proxy server
       currentAccessToken = authRecord.access ?? null;
+      console.log("[Cursor Plugin] Access token set:", currentAccessToken ? "yes" : "no");
 
       // Set model costs to 0 (Cursor handles billing)
       if (provider.models) {
@@ -527,6 +542,8 @@ export const CursorOAuthPlugin = async ({
 
       // Start the proxy server
       startProxyServer();
+
+      console.log("[Cursor Plugin] Returning baseURL:", CURSOR_PROXY_BASE_URL);
 
       return {
         apiKey: "cursor-via-opencode", // Dummy key, not used
