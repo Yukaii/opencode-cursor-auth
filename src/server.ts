@@ -13,7 +13,7 @@
  *   bun run src/server.ts
  */
 
-import { createAgentServiceClient, AgentMode, type OpenAIToolDefinition, type ExecRequest, type McpExecRequest } from "./lib/api/agent-service";
+import { createAgentServiceClient, AgentMode, type OpenAIToolDefinition, type ExecRequest, type McpExecRequest, type AgentStreamChunk } from "./lib/api/agent-service";
 import { FileCredentialManager } from "./lib/storage";
 
 // --- Constants ---
@@ -29,6 +29,35 @@ interface OpenAIToolCall {
     name: string;
     arguments: string;
   };
+}
+
+// --- Session Management for Cursor stream reuse ---
+interface CursorSession {
+  id: string;
+  client: ReturnType<typeof createAgentServiceClient>;
+  iterator: AsyncGenerator<AgentStreamChunk>;
+  pendingExecs: Map<string, ExecRequest>;
+  createdAt: number;
+  lastActivity: number;
+  model: string;
+}
+
+const cursorSessions = new Map<string, CursorSession>();
+const SESSION_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes idle timeout
+
+function createSessionId(): string {
+  return crypto.randomUUID().replace(/-/g, "").slice(0, 12);
+}
+
+function makeToolCallId(sessionId: string, callBase: string): string {
+  return `sess_${sessionId}__call_${callBase}`;
+}
+
+function parseSessionIdFromToolCallId(toolCallId: string | null | undefined): string | null {
+  if (!toolCallId) return null;
+  const match = toolCallId.match(/^sess_([a-zA-Z0-9]+)__call_/);
+  if (!match) return null;
+  return match[1] ?? null;
 }
 
 interface OpenAIMessage {
