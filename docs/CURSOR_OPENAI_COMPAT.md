@@ -104,3 +104,25 @@ When the client sends a follow-up request with tool results, `messagesToPrompt()
 System: <system message>
 
 User: <original query>
+
+Assistant: [Called tool: read({"filePath":"/tmp/x"})]
+
+[Tool result for call_abc123]: <file contents>
+
+Assistant: <continuation after tool>
+```
+
+## Session Reuse Strategy (planned)
+
+**Problem:** Cursor’s Agent API keeps a single persistent stream per conversation. Our OpenAI translation currently starts a *new* Cursor session for every turn, paying ~6s bootstrap each time and losing the benefit of Cursor’s stream reuse.
+
+**Goal:** Reuse the same Cursor session across turns (and across tool calls) while still presenting the OpenAI multi-turn pattern. Support multiple parallel OpenCode windows by isolating sessions.
+
+**Plan:**
+- **Session ID:** Generate a unique sessionId per incoming OpenAI conversation (e.g., per first request). Encode it into each emitted `tool_call_id` (`call_<sessionId>_<cursorCallId>`).
+- **Session store:** Keep `{ client, requestId, appendSeqno }` per sessionId. One Cursor stream per OpenCode window.
+- **Tool results routing:** When a follow-up request has `role: "tool"` messages, extract `tool_call_id`, recover `sessionId`, and route the tool result via the existing Cursor stream (`bidiAppend`) instead of starting a new session.
+- **Continuation:** After sending tool results to Cursor, continue reading from the existing stream and forward the assistant’s continuation to the OpenAI client.
+- **Cleanup:** Idle timeout and explicit completion tear down the session. If a sessionId is unknown, fall back to starting a fresh session.
+
+**Multi-window safety:** Each OpenCode window keeps its own sessionId (embedded in its tool_call_ids), so sessions are isolated and can run in parallel without collision.
