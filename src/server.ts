@@ -452,7 +452,7 @@ async function handleChatCompletions(req: Request, accessToken: string): Promise
     let toolCallIndex = 0;
     const toolCallIdMap: Map<string, number> = new Map(); // Map Cursor call IDs to OpenAI indices
     let toolExecutionCompleted = false;  // Track if we've completed tool execution
-    let hasReceivedExecRequest = false;  // Track if we've ever received an exec request
+    let heartbeatCountAfterExec = 0;     // Count heartbeats after tool execution
     
     const readable = new ReadableStream({
       async start(controller) {
@@ -492,87 +492,17 @@ async function handleChatCompletions(req: Request, accessToken: string): Promise
                 controller.enqueue(encoder.encode(createSSEChunk(streamChunk)));
               }
             } else if (chunk.type === "tool_call_started" && chunk.toolCall) {
-              // Map Cursor tool to OpenAI tool call format
-              hasToolCalls = true;
-              const currentIndex = toolCallIndex++;
-              toolCallIdMap.set(chunk.toolCall.callId, currentIndex);
-              
-              // Generate OpenAI-style tool call ID
-              const openaiToolCallId = `call_${chunk.toolCall.callId.replace(/-/g, "").slice(0, 24)}`;
-              
-              const toolCallChunk: OpenAIStreamChunk = {
-                id: completionId,
-                object: "chat.completion.chunk",
-                created,
-                model: body.model ?? "gpt-4o",
-                choices: [{
-                  index: 0,
-                  delta: {
-                    tool_calls: [{
-                      index: currentIndex,
-                      id: openaiToolCallId,
-                      type: "function",
-                      function: {
-                        name: chunk.toolCall.name,
-                        arguments: "", // Arguments come in partial updates or completed
-                      },
-                    }],
-                  },
-                  finish_reason: null,
-                }],
-              };
-              controller.enqueue(encoder.encode(createSSEChunk(toolCallChunk)));
-              
-              // Also send initial arguments if available
-              if (chunk.toolCall.arguments && chunk.toolCall.arguments !== "{}") {
-                const argsChunk: OpenAIStreamChunk = {
-                  id: completionId,
-                  object: "chat.completion.chunk",
-                  created,
-                  model: body.model ?? "gpt-4o",
-                  choices: [{
-                    index: 0,
-                    delta: {
-                      tool_calls: [{
-                        index: currentIndex,
-                        function: {
-                          arguments: chunk.toolCall.arguments,
-                        },
-                      }],
-                    },
-                    finish_reason: null,
-                  }],
-                };
-                controller.enqueue(encoder.encode(createSSEChunk(argsChunk)));
-              }
+              // Tool call started - we handle these internally via exec_requests
+              // Don't emit to OpenAI client since we execute them locally
+              console.log(`[DEBUG] Tool call started: ${chunk.toolCall.name} (handled internally)`);
+              toolCallIdMap.set(chunk.toolCall.callId, toolCallIndex++);
             } else if (chunk.type === "partial_tool_call" && chunk.toolCall && chunk.partialArgs) {
-              // Stream partial arguments
-              const idx = toolCallIdMap.get(chunk.toolCall.callId);
-              if (idx !== undefined) {
-                const partialChunk: OpenAIStreamChunk = {
-                  id: completionId,
-                  object: "chat.completion.chunk",
-                  created,
-                  model: body.model ?? "gpt-4o",
-                  choices: [{
-                    index: 0,
-                    delta: {
-                      tool_calls: [{
-                        index: idx,
-                        function: {
-                          arguments: chunk.partialArgs,
-                        },
-                      }],
-                    },
-                    finish_reason: null,
-                  }],
-                };
-                controller.enqueue(encoder.encode(createSSEChunk(partialChunk)));
-              }
+              // Partial tool call arguments - ignore since we handle via exec_requests
+              // Just log for debugging
+              console.log(`[DEBUG] Partial tool call for: ${chunk.toolCall.callId}`);
             } else if (chunk.type === "tool_call_completed" && chunk.toolCall) {
-              // Tool call completed - we could send final args here if needed
-              // For now, just track that tool calls happened
-              hasToolCalls = true;
+              // Tool call completed - we'll get the actual execution via exec_request
+              console.log(`[DEBUG] Tool call completed: ${chunk.toolCall.name}`);
             } else if (chunk.type === "exec_request" && chunk.execRequest) {
               // Server is requesting tool execution
               const execReq = chunk.execRequest;
@@ -645,14 +575,22 @@ async function handleChatCompletions(req: Request, accessToken: string): Promise
                 try {
                   const file = Bun.file(execReq.path);
                   const content = await file.text();
+                  const stats = await file.stat();
+                  const totalLines = content.split('\n').length;
+                  const fileSize = BigInt(stats.size);
+                  const truncated = false; // TODO: implement truncation if needed
+                  
                   console.log(`[DEBUG] File content (${content.length} chars): ${content.slice(0, 200)}`);
                   
-                  await client.sendReadResult(execReq.id, execReq.execId, content);
+                  await client.sendReadResult(execReq.id, execReq.execId, content, execReq.path, totalLines, fileSize, truncated);
                   console.log("[DEBUG] Sent read result");
                   toolExecutionCompleted = true;
                 } catch (err: any) {
                   console.error("[ERROR] File read failed:", err.message);
-                  await client.sendReadResult(execReq.id, execReq.execId, `Error: ${err.message}`);
+                  // For errors, we still need to send a proper ReadResult
+                  // but with an error case instead of success
+                  // For now, send empty content with path - the server might handle this better
+                  await client.sendReadResult(execReq.id, execReq.execId, `Error: ${err.message}`, execReq.path, 0, 0n, false);
                   toolExecutionCompleted = true;
                 }
               } else if (execReq.type === 'mcp') {
@@ -720,18 +658,22 @@ async function handleChatCompletions(req: Request, accessToken: string): Promise
               // Stream is ending
               break;
             } else if (chunk.type === "checkpoint") {
-              // Checkpoint received
-              console.log("[DEBUG] Checkpoint received, toolExecutionCompleted:", toolExecutionCompleted);
-              
+              // Checkpoint received - this happens after tool execution
+              // We should continue waiting for the model's response after processing tool results
+              console.log("[DEBUG] Checkpoint received, continuing to wait for model response...");
+              // Don't reset toolExecutionCompleted - we'll use it to track heartbeats
+            } else if (chunk.type === "heartbeat") {
+              // Heartbeat received - model is still thinking/working
               if (toolExecutionCompleted) {
-                // If we've completed tool execution and received a checkpoint, end the stream
-                // The model typically sends heartbeats after this but no more content
-                console.log("[DEBUG] Tool execution completed, ending stream after checkpoint");
-                break;
+                heartbeatCountAfterExec++;
+                console.log(`[DEBUG] Heartbeat after tool execution: ${heartbeatCountAfterExec}`);
+                // After 10 heartbeats post-exec without text, assume the model is done
+                // (This is a heuristic - the model should send turn_ended but sometimes doesn't)
+                if (heartbeatCountAfterExec >= 10) {
+                  console.log("[DEBUG] Ending stream after 10 heartbeats post-exec");
+                  break;
+                }
               }
-              // Track that we've seen a checkpoint - exec messages may follow
-              hasReceivedExecRequest = false;  // Reset for next batch
-              console.log("[DEBUG] Continuing to wait for exec messages...");
             }
           }
           

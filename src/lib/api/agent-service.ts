@@ -756,6 +756,18 @@ export interface ReadExecRequest {
 }
 
 /**
+ * Grep/Glob execution request
+ */
+export interface GrepExecRequest {
+  type: 'grep';
+  id: number;
+  execId?: string;
+  pattern: string;
+  path?: string;
+  glob?: string;
+}
+
+/**
  * Union type for all exec requests
  */
 export type ExecRequest = 
@@ -763,7 +775,8 @@ export type ExecRequest =
   | ShellExecRequest 
   | LsExecRequest 
   | RequestContextExecRequest
-  | ReadExecRequest;
+  | ReadExecRequest
+  | GrepExecRequest;
 
 /**
  * Parse google.protobuf.Value from protobuf bytes
@@ -982,6 +995,32 @@ function parseReadArgs(data: Uint8Array): { path: string } {
 }
 
 /**
+ * Parse grep_args (also used for glob)
+ * GrepArgs:
+ *   field 1: pattern (string)
+ *   field 2: path (string, optional)
+ *   field 3: glob (string, optional)
+ */
+function parseGrepArgs(data: Uint8Array): { pattern: string; path?: string; glob?: string } {
+  const fields = parseProtoFields(data);
+  let pattern = '';
+  let path: string | undefined;
+  let glob: string | undefined;
+  
+  for (const field of fields) {
+    if (field.fieldNumber === 1 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      pattern = new TextDecoder().decode(field.value);
+    } else if (field.fieldNumber === 2 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      path = new TextDecoder().decode(field.value);
+    } else if (field.fieldNumber === 3 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      glob = new TextDecoder().decode(field.value);
+    }
+  }
+  
+  return { pattern, path, glob };
+}
+
+/**
  * Parse ExecServerMessage to extract all exec types
  * ExecServerMessage:
  *   field 1: id (uint32)
@@ -1016,6 +1055,11 @@ function parseExecServerMessage(data: Uint8Array): ExecRequest | null {
       case 14: { // shell_stream_args
         const shellArgs = parseShellArgs(field.value);
         result = { type: 'shell', id, execId, command: shellArgs.command, cwd: shellArgs.cwd };
+        break;
+      }
+      case 5: { // grep_args (also used for glob)
+        const grepArgs = parseGrepArgs(field.value);
+        result = { type: 'grep', id, execId, pattern: grepArgs.pattern, path: grepArgs.path, glob: grepArgs.glob };
         break;
       }
       case 7: { // read_args
@@ -1310,11 +1354,44 @@ function buildExecClientMessageWithRequestContextResult(id: number, execId: stri
  * Build ReadResult message
  * ReadResult:
  *   field 1: success (ReadSuccess) - oneof result
+ *   field 2: error (ReadError) - oneof result
+ *   field 3: rejected (ReadRejected) - oneof result
+ *   field 4: file_not_found (ReadFileNotFound) - oneof result
+ *   field 5: permission_denied (ReadPermissionDenied) - oneof result
+ * 
  * ReadSuccess:
- *   field 1: content (string)
+ *   field 1: path (string) - the file path that was read
+ *   field 2: content (string) - oneof output (for text files)
+ *   field 3: total_lines (int32)
+ *   field 4: file_size (int64)
+ *   field 5: data (bytes) - oneof output (for binary/image files)
+ *   field 6: truncated (bool)
  */
-function encodeReadResult(content: string): Uint8Array {
-  const readSuccess = encodeStringField(1, content);
+function encodeReadResult(content: string, path: string, totalLines?: number, fileSize?: bigint, truncated?: boolean): Uint8Array {
+  const parts: Uint8Array[] = [];
+  
+  // field 1: path (required)
+  parts.push(encodeStringField(1, path));
+  
+  // field 2: content (oneof output - for text files)
+  parts.push(encodeStringField(2, content));
+  
+  // field 3: total_lines
+  if (totalLines !== undefined && totalLines > 0) {
+    parts.push(encodeInt32Field(3, totalLines));
+  }
+  
+  // field 4: file_size
+  if (fileSize !== undefined) {
+    parts.push(encodeInt64Field(4, fileSize));
+  }
+  
+  // field 6: truncated
+  if (truncated) {
+    parts.push(encodeBoolField(6, true));
+  }
+  
+  const readSuccess = concatBytes(...parts);
   return encodeMessageField(1, readSuccess);
 }
 
@@ -1325,13 +1402,124 @@ function encodeReadResult(content: string): Uint8Array {
  *   field 15: exec_id (string) - optional
  *   field 7: read_result (ReadResult) - oneof message
  */
-function buildExecClientMessageWithReadResult(id: number, execId: string | undefined, content: string): Uint8Array {
+function buildExecClientMessageWithReadResult(
+  id: number, 
+  execId: string | undefined, 
+  content: string, 
+  path: string,
+  totalLines?: number,
+  fileSize?: bigint,
+  truncated?: boolean
+): Uint8Array {
   const parts: Uint8Array[] = [];
   parts.push(encodeUint32Field(1, id));
   if (execId) {
     parts.push(encodeStringField(15, execId));
   }
-  parts.push(encodeMessageField(7, encodeReadResult(content)));
+  parts.push(encodeMessageField(7, encodeReadResult(content, path, totalLines, fileSize, truncated)));
+  return concatBytes(...parts);
+}
+
+/**
+ * Build GrepFilesResult message
+ * GrepFilesResult:
+ *   field 1: files (repeated string) - list of matching file paths
+ *   field 2: total_files (int32)
+ *   field 3: client_truncated (bool)
+ *   field 4: ripgrep_truncated (bool)
+ */
+function encodeGrepFilesResult(files: string[], totalFiles: number, truncated: boolean = false): Uint8Array {
+  const parts: Uint8Array[] = [];
+  
+  // field 1: files (repeated string)
+  for (const file of files) {
+    parts.push(encodeStringField(1, file));
+  }
+  
+  // field 2: total_files
+  parts.push(encodeInt32Field(2, totalFiles));
+  
+  // field 3: client_truncated
+  if (truncated) {
+    parts.push(encodeBoolField(3, true));
+  }
+  
+  return concatBytes(...parts);
+}
+
+/**
+ * Build GrepUnionResult message with files result
+ * GrepUnionResult:
+ *   field 2: files (GrepFilesResult) - oneof result
+ */
+function encodeGrepUnionResult(files: string[], totalFiles: number, truncated: boolean = false): Uint8Array {
+  const filesResult = encodeGrepFilesResult(files, totalFiles, truncated);
+  return encodeMessageField(2, filesResult);
+}
+
+/**
+ * Build GrepSuccess message
+ * GrepSuccess:
+ *   field 1: pattern (string)
+ *   field 2: path (string)
+ *   field 3: output_mode (string) - "files_with_matches"
+ *   field 4: workspace_results (map<string, GrepUnionResult>)
+ */
+function encodeGrepSuccess(pattern: string, path: string, files: string[]): Uint8Array {
+  const parts: Uint8Array[] = [];
+  
+  // field 1: pattern
+  parts.push(encodeStringField(1, pattern));
+  
+  // field 2: path
+  parts.push(encodeStringField(2, path));
+  
+  // field 3: output_mode
+  parts.push(encodeStringField(3, "files_with_matches"));
+  
+  // field 4: workspace_results - map entry: key=path, value=GrepUnionResult
+  // Map entry: field 1 = key (string), field 2 = value (GrepUnionResult)
+  const unionResult = encodeGrepUnionResult(files, files.length);
+  const mapEntry = concatBytes(
+    encodeStringField(1, path),
+    encodeMessageField(2, unionResult)
+  );
+  parts.push(encodeMessageField(4, mapEntry));
+  
+  return concatBytes(...parts);
+}
+
+/**
+ * Build GrepResult message
+ * GrepResult:
+ *   field 1: success (GrepSuccess) - oneof result
+ *   field 2: error (GrepError) - oneof result
+ */
+function encodeGrepResult(pattern: string, path: string, files: string[]): Uint8Array {
+  const success = encodeGrepSuccess(pattern, path, files);
+  return encodeMessageField(1, success);
+}
+
+/**
+ * Build ExecClientMessage with grep_result
+ * ExecClientMessage:
+ *   field 1: id (uint32)
+ *   field 15: exec_id (string) - optional
+ *   field 5: grep_result (GrepResult) - oneof message
+ */
+function buildExecClientMessageWithGrepResult(
+  id: number,
+  execId: string | undefined,
+  pattern: string,
+  path: string,
+  files: string[]
+): Uint8Array {
+  const parts: Uint8Array[] = [];
+  parts.push(encodeUint32Field(1, id));
+  if (execId) {
+    parts.push(encodeStringField(15, execId));
+  }
+  parts.push(encodeMessageField(5, encodeGrepResult(pattern, path, files)));
   return concatBytes(...parts);
 }
 
@@ -1569,7 +1757,7 @@ export interface ToolCallInfo {
 }
 
 export interface AgentStreamChunk {
-  type: "text" | "thinking" | "token" | "checkpoint" | "done" | "error" | "tool_call_started" | "tool_call_completed" | "partial_tool_call" | "exec_request";
+  type: "text" | "thinking" | "token" | "checkpoint" | "done" | "error" | "tool_call_started" | "tool_call_completed" | "partial_tool_call" | "exec_request" | "heartbeat";
   content?: string;
   error?: string;
   toolCall?: ToolCallInfo;
@@ -1831,14 +2019,22 @@ export class AgentServiceClient {
   /**
    * Send a file read result back to the server
    */
-  async sendReadResult(id: number, execId: string | undefined, content: string): Promise<void> {
+  async sendReadResult(
+    id: number, 
+    execId: string | undefined, 
+    content: string,
+    path: string,
+    totalLines?: number,
+    fileSize?: bigint,
+    truncated?: boolean
+  ): Promise<void> {
     if (!this.currentRequestId) {
       throw new Error("No active chat stream - cannot send read result");
     }
     
-    console.log("[DEBUG] Sending read result for id:", id);
+    console.log("[DEBUG] Sending read result for id:", id, "path:", path, "contentLength:", content.length);
     
-    const execClientMsg = buildExecClientMessageWithReadResult(id, execId, content);
+    const execClientMsg = buildExecClientMessageWithReadResult(id, execId, content, path, totalLines, fileSize, truncated);
     const responseMsg = buildAgentClientMessageWithExec(execClientMsg);
     
     await this.bidiAppend(this.currentRequestId, this.currentAppendSeqno, responseMsg);
@@ -1851,6 +2047,7 @@ export class AgentServiceClient {
   private parseInteractionUpdate(data: Uint8Array): {
     text: string | null;
     isComplete: boolean;
+    isHeartbeat: boolean;
     toolCallStarted: { callId: string; modelCallId: string; toolType: string; name: string; arguments: string } | null;
     toolCallCompleted: { callId: string; modelCallId: string; toolType: string; name: string; arguments: string } | null;
     partialToolCall: { callId: string; argsTextDelta: string } | null;
@@ -1861,6 +2058,7 @@ export class AgentServiceClient {
     
     let text: string | null = null;
     let isComplete = false;
+    let isHeartbeat = false;
     let toolCallStarted: { callId: string; modelCallId: string; toolType: string; name: string; arguments: string } | null = null;
     let toolCallCompleted: { callId: string; modelCallId: string; toolType: string; name: string; arguments: string } | null = null;
     let partialToolCall: { callId: string; argsTextDelta: string } | null = null;
@@ -1928,12 +2126,11 @@ export class AgentServiceClient {
       }
       // field 13 = heartbeat
       else if (field.fieldNumber === 13) {
-        // Just log - we don't need to do anything special with heartbeats
-        // The server will handle counting them
+        isHeartbeat = true;
       }
     }
     
-    return { text, isComplete, toolCallStarted, toolCallCompleted, partialToolCall };
+    return { text, isComplete, isHeartbeat, toolCallStarted, toolCallCompleted, partialToolCall };
   }
 
   /**
@@ -2092,6 +2289,11 @@ export class AgentServiceClient {
                   
                   if (parsed.isComplete) {
                     turnEnded = true;
+                  }
+                  
+                  // Yield heartbeat events for the server to track
+                  if (parsed.isHeartbeat) {
+                    yield { type: "heartbeat" };
                   }
                 }
                 
