@@ -1,7 +1,7 @@
 # Tool Calling Investigation Summary
 
-**Date**: December 7, 2025  
-**Status**: In Progress - Blocked on tool call execution
+**Date**: December 8, 2025  
+**Status**: In Progress - Architecture decision needed
 
 ## Overview
 
@@ -267,6 +267,247 @@ tools: mcpTools.map(tool => new mcp_pb.McpToolDefinition({
   inputSchema: tool.inputSchema ? struct_pb.Value.fromJson(tool.inputSchema) : undefined
 }))
 ```
+
+## Key Discovery (Dec 8)
+
+### How Cursor's Native Tool Flow Actually Works
+
+After analyzing `connect.js`, `exec-controller.js`, `controlled.js`, and `mcp.js`, the full picture is now clear:
+
+**Cursor expects the CLIENT to execute tools locally.** The server doesn't run tools - it instructs the client what to do, and the client responds with results.
+
+### The Bidirectional Message Flow
+
+```
+┌──────────────────┐                          ┌────────────────────┐
+│   OpenAI Client  │                          │   Cursor Backend   │
+└────────┬─────────┘                          └────────┬───────────┘
+         │                                             │
+         │  1. AgentRunRequest (with tools)            │
+         │────────────────────────────────────────────▶│
+         │                                             │
+         │  2. InteractionUpdate (text_delta)          │
+         │◀────────────────────────────────────────────│
+         │                                             │
+         │  3. ExecServerMessage (mcp_args)            │
+         │◀────────────────────────────────────────────│
+         │     "Execute tool X with args Y"            │
+         │                                             │
+         │  4. ExecClientMessage (mcp_result)          │
+         │────────────────────────────────────────────▶│
+         │     "Here's the result"                     │
+         │                                             │
+         │  5. ExecClientControlMessage (stream_close) │
+         │────────────────────────────────────────────▶│
+         │                                             │
+         │  6. InteractionUpdate (more text)           │
+         │◀────────────────────────────────────────────│
+         │                                             │
+         │  7. CheckpointUpdate (done)                 │
+         │◀────────────────────────────────────────────│
+         │                                             │
+```
+
+### Proto Messages Involved
+
+**ExecServerMessage** (what server sends to request tool execution):
+```protobuf
+message ExecServerMessage {
+  uint32 id = 1;          // Correlation ID
+  string exec_id = 15;    // Unique execution ID
+  
+  oneof message {
+    ShellArgs shell_args = 2;
+    WriteArgs write_args = 3;
+    DeleteArgs delete_args = 4;
+    GrepArgs grep_args = 5;
+    ReadArgs read_args = 7;
+    LsArgs ls_args = 8;
+    DiagnosticsArgs diagnostics_args = 9;
+    RequestContextArgs request_context_args = 10;
+    McpArgs mcp_args = 11;              // ◀ MCP tool call
+    ShellArgs shell_stream_args = 14;
+    BackgroundShellSpawnArgs background_shell_spawn_args = 16;
+    ListMcpResourcesExecArgs list_mcp_resources_exec_args = 17;
+    ReadMcpResourceExecArgs read_mcp_resource_exec_args = 18;
+    FetchArgs fetch_args = 20;
+    RecordScreenArgs record_screen_args = 21;
+    ComputerUseArgs computer_use_args = 22;
+  }
+  
+  SpanContext span_context = 19;
+}
+```
+
+**McpArgs** (inside ExecServerMessage.mcp_args):
+```protobuf
+message McpArgs {
+  string name = 1;                          // "provider___toolname"
+  map<string, google.protobuf.Value> args = 2;  // Tool arguments
+  string tool_call_id = 3;                  // Correlation ID
+  string provider_identifier = 4;           // e.g., "opencode"
+  string tool_name = 5;                     // e.g., "bash"
+}
+```
+
+**ExecClientMessage** (what client sends back with result):
+```protobuf
+message ExecClientMessage {
+  uint32 id = 1;          // Must match ExecServerMessage.id
+  string exec_id = 15;    // Must match ExecServerMessage.exec_id
+  
+  oneof message {
+    ShellResult shell_result = 2;
+    WriteResult write_result = 3;
+    DeleteResult delete_result = 4;
+    GrepResult grep_result = 5;
+    ReadResult read_result = 7;
+    LsResult ls_result = 8;
+    DiagnosticsResult diagnostics_result = 9;
+    RequestContextResult request_context_result = 10;
+    McpResult mcp_result = 11;              // ◀ MCP tool result
+    ShellStream shell_stream = 14;
+    BackgroundShellSpawnResult background_shell_spawn_result = 16;
+    ListMcpResourcesExecResult list_mcp_resources_exec_result = 17;
+    ReadMcpResourceExecResult read_mcp_resource_exec_result = 18;
+    FetchResult fetch_result = 20;
+    RecordScreenResult record_screen_result = 21;
+    ComputerUseResult computer_use_result = 22;
+  }
+}
+```
+
+**McpResult** (inside ExecClientMessage.mcp_result):
+```protobuf
+message McpResult {
+  oneof result {
+    McpSuccess success = 1;
+    McpError error = 2;
+    McpRejected rejected = 3;
+    McpPermissionDenied permission_denied = 4;
+  }
+}
+
+message McpSuccess {
+  repeated McpToolResultContentItem content = 1;
+  bool is_error = 2;
+}
+
+message McpToolResultContentItem {
+  oneof content {
+    McpTextContent text = 1;
+    McpImageContent image = 2;
+  }
+}
+```
+
+**ExecClientControlMessage** (control flow):
+```protobuf
+message ExecClientControlMessage {
+  oneof message {
+    ExecClientStreamClose stream_close = 1;  // Exec completed successfully
+    ExecClientThrow throw = 2;               // Exec failed
+  }
+}
+
+message ExecClientStreamClose {
+  uint32 id = 1;  // Must match ExecServerMessage.id
+}
+```
+
+### The Root Cause
+
+**Our current implementation only SENDS tools to the server and expects it to handle them.** But Cursor's architecture is **different**:
+
+1. We send tools (correctly)
+2. Server instructs us to execute via `ExecServerMessage` (we receive but don't handle)
+3. We never send back `ExecClientMessage` with results
+4. Server waits, times out, and checkpoints without output
+
+### Solution Options
+
+#### Option A: Full Local Execution (Like Native Cursor)
+
+Implement all the local executors:
+- Shell executor (run bash commands)
+- File executor (read/write/delete files)
+- MCP executor (call MCP tools)
+- etc.
+
+**Pros**: Full compatibility with Cursor's tool system
+**Cons**: Large implementation effort, security concerns
+
+#### Option B: Callback Pattern (Recommended for OpenAI Proxy)
+
+Re-architect to pass tool calls back to OpenAI client:
+
+1. Receive `ExecServerMessage.mcp_args` from Cursor
+2. Convert to OpenAI tool_call format
+3. Stream to OpenAI client
+4. Wait for tool result from OpenAI client
+5. Convert result to `ExecClientMessage.mcp_result`
+6. Send back to Cursor via `BidiAppend`
+
+**Pros**: Maintains OpenAI-compatible interface, client handles execution
+**Cons**: Requires changes to streaming protocol (need to pause/resume)
+
+#### Option C: Ask Mode Without Tools
+
+Use Cursor in "ask" mode without tools, then handle tools entirely on our side.
+
+**Pros**: Simplest implementation
+**Cons**: Loses benefits of Cursor's native tool calling
+
+### Implementation Plan for Option B
+
+```typescript
+// In chatStream(), when we receive ExecServerMessage:
+if (field.fieldNumber === 2 && field.wireType === 2 && field.value instanceof Uint8Array) {
+  const execMsg = parseExecServerMessage(field.value);
+  
+  if (execMsg.messageType === 'mcp_args') {
+    // Convert to OpenAI tool call
+    const toolCallChunk = {
+      type: "tool_call_started",
+      toolCall: {
+        callId: execMsg.toolCallId,
+        name: execMsg.toolName,
+        arguments: JSON.stringify(execMsg.args),
+      },
+    };
+    yield toolCallChunk;
+    
+    // Wait for tool result from caller (need new protocol)
+    const result = await waitForToolResult(execMsg.toolCallId);
+    
+    // Send result back to Cursor
+    const execClientMsg = buildExecClientMessage(execMsg.id, result);
+    await this.bidiAppend(requestId, appendSeqno++, execClientMsg);
+    
+    // Send control message
+    const controlMsg = buildExecClientControlMessage(execMsg.id);
+    await this.bidiAppend(requestId, appendSeqno++, controlMsg);
+  }
+}
+```
+
+### Files to Modify
+
+1. **`src/lib/api/agent-service.ts`**:
+   - Add `parseExecServerMessage()` function
+   - Add `buildExecClientMessage()` function
+   - Add `buildExecClientControlMessage()` function
+   - Modify `chatStream()` to handle exec messages
+
+2. **`src/server.ts`**:
+   - Add endpoint or callback for tool results
+   - Modify streaming logic to support tool call/result flow
+
+### Reference Code Locations
+
+- Tool execution handling: `cursor-agent-restored-source-code/local-exec/dist/mcp.js:794-953`
+- Exec controller: `cursor-agent-restored-source-code/agent-exec/dist/controlled.js:173-260`
+- Connect stream splitter: `cursor-agent-restored-source-code/agent-client/dist/connect.js:162-222`
 
 ## Environment
 

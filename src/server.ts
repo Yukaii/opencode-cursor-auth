@@ -13,7 +13,7 @@
  *   bun run src/server.ts
  */
 
-import { createAgentServiceClient, AgentMode, type OpenAIToolDefinition } from "./lib/api/agent-service";
+import { createAgentServiceClient, AgentMode, type OpenAIToolDefinition, type McpExecRequest } from "./lib/api/agent-service";
 import { FileCredentialManager } from "./lib/storage";
 
 // --- Constants ---
@@ -571,6 +571,60 @@ async function handleChatCompletions(req: Request, accessToken: string): Promise
               // Tool call completed - we could send final args here if needed
               // For now, just track that tool calls happened
               hasToolCalls = true;
+            } else if (chunk.type === "exec_request" && chunk.execRequest) {
+              // Server is requesting tool execution
+              // Convert to OpenAI tool call format and emit
+              hasToolCalls = true;
+              const execReq = chunk.execRequest;
+              const currentIndex = toolCallIndex++;
+              
+              console.log("[DEBUG] Received exec_request:", {
+                id: execReq.id,
+                toolName: execReq.toolName,
+                args: execReq.args,
+              });
+              
+              // Generate OpenAI-style tool call ID
+              const openaiToolCallId = `call_${execReq.toolCallId.replace(/-/g, "").slice(0, 24) || execReq.id}`;
+              
+              // Send tool call start
+              const toolCallChunk: OpenAIStreamChunk = {
+                id: completionId,
+                object: "chat.completion.chunk",
+                created,
+                model: body.model ?? "gpt-4o",
+                choices: [{
+                  index: 0,
+                  delta: {
+                    tool_calls: [{
+                      index: currentIndex,
+                      id: openaiToolCallId,
+                      type: "function",
+                      function: {
+                        name: execReq.toolName,
+                        arguments: JSON.stringify(execReq.args),
+                      },
+                    }],
+                  },
+                  finish_reason: null,
+                }],
+              };
+              controller.enqueue(encoder.encode(createSSEChunk(toolCallChunk)));
+              
+              // Send a placeholder result back to Cursor to keep the stream flowing
+              // This tells Cursor "tool executed, here's the result"
+              // The actual execution will be done by the OpenAI client
+              try {
+                await client.sendToolResult(execReq, {
+                  success: {
+                    content: `Tool "${execReq.toolName}" execution request forwarded to OpenAI client. Tool call ID: ${openaiToolCallId}`,
+                    isError: false,
+                  },
+                });
+                console.log("[DEBUG] Sent placeholder tool result for:", execReq.toolName);
+              } catch (err: any) {
+                console.error("[ERROR] Failed to send tool result:", err.message);
+              }
             } else if (chunk.type === "error") {
               // Send error in stream format
               console.error("Cursor API error:", chunk.error);

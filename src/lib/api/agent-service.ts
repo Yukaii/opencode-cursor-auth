@@ -237,13 +237,16 @@ export interface OpenAIToolDefinition {
  *   field 4: provider_identifier (string)
  *   field 5: tool_name (string)
  */
-function encodeMcpToolDefinition(tool: OpenAIToolDefinition, providerIdentifier: string = "opencode"): Uint8Array {
+function encodeMcpToolDefinition(tool: OpenAIToolDefinition, providerIdentifier: string = "cursor-tools"): Uint8Array {
   const toolName = tool.function.name;
-  // The name field should be the combined identifier (provider___toolname)
-  // This is how the server expects to identify the tool
-  const combinedName = `${providerIdentifier}___${toolName}`;
+  // The name field should be the combined identifier (provider-toolname) with hyphen
+  // This matches how Cursor's McpManager creates tool names: `${tool.clientName}-${tool.name}`
+  // Using "cursor-tools" as provider to look like a built-in provider
+  const combinedName = `${providerIdentifier}-${toolName}`;
   const description = tool.function.description ?? "";
   const inputSchema = tool.function.parameters ?? { type: "object", properties: {} };
+  
+  console.log(`[DEBUG] Encoding tool: name=${combinedName}, providerIdentifier=${providerIdentifier}, toolName=${toolName}`);
   
   const parts: Uint8Array[] = [
     encodeStringField(1, combinedName),
@@ -306,11 +309,25 @@ function buildRequestContextEnv(workspacePath: string = process.cwd()): Uint8Arr
 }
 
 /**
+ * Encode McpInstructions message
+ * McpInstructions:
+ *   field 1: server_name (string)
+ *   field 2: instructions (string)
+ */
+function encodeMcpInstructions(serverName: string, instructions: string): Uint8Array {
+  return concatBytes(
+    encodeStringField(1, serverName),
+    encodeStringField(2, instructions)
+  );
+}
+
+/**
  * Build RequestContext
  * field 2: rules (repeated CursorRule) - optional
  * field 4: env (RequestContextEnv)
  * field 7: tools (repeated McpToolDefinition) - IMPORTANT for tool calling
  * field 11: git_repos (repeated GitRepoInfo) - optional
+ * field 14: mcp_instructions (repeated McpInstructions) - instructions for MCP tools
  */
 function buildRequestContext(workspacePath?: string, tools?: OpenAIToolDefinition[]): Uint8Array {
   const parts: Uint8Array[] = [];
@@ -319,13 +336,27 @@ function buildRequestContext(workspacePath?: string, tools?: OpenAIToolDefinitio
   const env = buildRequestContextEnv(workspacePath);
   parts.push(encodeMessageField(4, env));
   
-  // field 7: tools - CRITICAL for tool calling to work!
+  // field 7: tools (repeated McpToolDefinition)
+  // Enable tools in RequestContext - this is where Cursor expects MCP tool definitions
+  // Use "cursor-tools" as provider identifier to look like a built-in tool provider
+  const MCP_PROVIDER = "cursor-tools";
   if (tools && tools.length > 0) {
     console.log(`[DEBUG] Adding ${tools.length} tools to RequestContext.tools (field 7)`);
     for (const tool of tools) {
-      const mcpTool = encodeMcpToolDefinition(tool, "opencode");
+      const mcpTool = encodeMcpToolDefinition(tool, MCP_PROVIDER);
       parts.push(encodeMessageField(7, mcpTool));
     }
+    
+    // field 14: mcp_instructions - provide instructions for the MCP tools
+    // Build instruction text describing all tools
+    const toolDescriptions = tools.map(t => 
+      `- ${t.function.name}: ${t.function.description || 'No description'}`
+    ).join('\n');
+    const instructions = `You have access to the following tools:\n${toolDescriptions}\n\nUse these tools when appropriate to help the user.`;
+    
+    const mcpInstr = encodeMcpInstructions(MCP_PROVIDER, instructions);
+    parts.push(encodeMessageField(14, mcpInstr));
+    console.log(`[DEBUG] Added MCP instructions for ${MCP_PROVIDER} server`);
   }
   
   return concatBytes(...parts);
@@ -338,6 +369,7 @@ function buildRequestContext(workspacePath?: string, tools?: OpenAIToolDefinitio
  * - mode: field 4 (enum/int32)
  */
 function encodeUserMessage(text: string, messageId: string, mode: AgentMode = AgentMode.ASK): Uint8Array {
+  console.log(`[DEBUG] encodeUserMessage: mode=${mode} (${AgentMode[mode]}), messageId=${messageId}`);
   return concatBytes(
     encodeStringField(1, text),
     encodeStringField(2, messageId),
@@ -385,14 +417,93 @@ function encodeEmptyConversationState(): Uint8Array {
  * Encode McpTools wrapper message
  * McpTools:
  *   field 1: mcp_tools (repeated McpToolDefinition)
+ * 
+ * This is a wrapper message that contains repeated tool definitions
  */
 function encodeMcpTools(tools: OpenAIToolDefinition[]): Uint8Array {
   const parts: Uint8Array[] = [];
+  const MCP_PROVIDER = "cursor-tools";
   for (const tool of tools) {
-    const mcpTool = encodeMcpToolDefinition(tool, "opencode");
+    const mcpTool = encodeMcpToolDefinition(tool, MCP_PROVIDER);
+    // field 1 in McpTools = repeated McpToolDefinition
     parts.push(encodeMessageField(1, mcpTool));
   }
   return concatBytes(...parts);
+}
+
+/**
+ * Encode McpDescriptor message
+ * McpDescriptor:
+ *   field 1: server_name (string) - Display name of the MCP server
+ *   field 2: server_identifier (string) - Unique identifier
+ *   field 3: folder_path (string, optional)
+ *   field 4: server_use_instructions (string, optional)
+ */
+function encodeMcpDescriptor(
+  serverName: string,
+  serverIdentifier: string,
+  folderPath?: string,
+  serverUseInstructions?: string
+): Uint8Array {
+  const parts: Uint8Array[] = [
+    encodeStringField(1, serverName),
+    encodeStringField(2, serverIdentifier),
+  ];
+  
+  if (folderPath) {
+    parts.push(encodeStringField(3, folderPath));
+  }
+  
+  if (serverUseInstructions) {
+    parts.push(encodeStringField(4, serverUseInstructions));
+  }
+  
+  return concatBytes(...parts);
+}
+
+/**
+ * Encode McpFileSystemOptions message
+ * McpFileSystemOptions:
+ *   field 1: enabled (bool)
+ *   field 2: workspace_project_dir (string)
+ *   field 3: mcp_descriptors (repeated McpDescriptor)
+ */
+function encodeMcpFileSystemOptions(
+  enabled: boolean,
+  workspaceProjectDir: string,
+  mcpDescriptors: Array<{ serverName: string; serverIdentifier: string; folderPath?: string; serverUseInstructions?: string }>
+): Uint8Array {
+  const parts: Uint8Array[] = [];
+  
+  // field 1: enabled
+  if (enabled) {
+    parts.push(encodeBoolField(1, true));
+  }
+  
+  // field 2: workspace_project_dir
+  if (workspaceProjectDir) {
+    parts.push(encodeStringField(2, workspaceProjectDir));
+  }
+  
+  // field 3: mcp_descriptors (repeated)
+  for (const descriptor of mcpDescriptors) {
+    const encodedDescriptor = encodeMcpDescriptor(
+      descriptor.serverName,
+      descriptor.serverIdentifier,
+      descriptor.folderPath,
+      descriptor.serverUseInstructions
+    );
+    parts.push(encodeMessageField(3, encodedDescriptor));
+  }
+  
+  return concatBytes(...parts);
+}
+
+/**
+ * Debug helper: dump protobuf as hex string
+ */
+function hexDump(data: Uint8Array): string {
+  return Buffer.from(data).toString('hex');
 }
 
 /**
@@ -402,12 +513,14 @@ function encodeMcpTools(tools: OpenAIToolDefinition[]): Uint8Array {
  * - model_details: field 3 (ModelDetails)
  * - mcp_tools: field 4 (McpTools) - tool definitions
  * - conversation_id: field 5 (string, optional)
+ * - mcp_file_system_options: field 6 (McpFileSystemOptions, optional) - enables MCP tool execution
  */
 function encodeAgentRunRequest(
   action: Uint8Array,
   modelDetails: Uint8Array,
   conversationId?: string,
-  tools?: OpenAIToolDefinition[]
+  tools?: OpenAIToolDefinition[],
+  workspacePath?: string
 ): Uint8Array {
   const conversationState = encodeEmptyConversationState();
   
@@ -417,17 +530,34 @@ function encodeAgentRunRequest(
     encodeMessageField(3, modelDetails),
   ];
   
-  // Add tools if provided
+  // field 4: mcp_tools (McpTools wrapper)
+  // This mirrors how Cursor builds AgentRunRequest - tools go in BOTH:
+  // 1. RequestContext.tools (field 7) - already added in buildRequestContext
+  // 2. AgentRunRequest.mcp_tools (field 4) - added here
   if (tools && tools.length > 0) {
-    console.log(`[DEBUG] Encoding ${tools.length} tools:`, tools.map(t => t.function.name));
-    const mcpTools = encodeMcpTools(tools);
-    console.log(`[DEBUG] McpTools encoded length: ${mcpTools.length}`);
-    parts.push(encodeMessageField(4, mcpTools));
+    const mcpToolsWrapper = encodeMcpTools(tools);
+    parts.push(encodeMessageField(4, mcpToolsWrapper));
+    console.log(`[DEBUG] Added mcp_tools (field 4) to AgentRunRequest with ${tools.length} tools`);
   }
   
-  // Add conversation_id if provided
+  // Add conversation_id if provided (field 5)
   if (conversationId) {
     parts.push(encodeStringField(5, conversationId));
+  }
+  
+  // field 6: mcp_file_system_options
+  // This enables MCP tool execution - provides workspace context and descriptor info
+  if (tools && tools.length > 0 && workspacePath) {
+    const MCP_PROVIDER = "cursor-tools";
+    const mcpDescriptors = [{
+      serverName: "Cursor Tools",
+      serverIdentifier: MCP_PROVIDER,
+      folderPath: workspacePath,
+      serverUseInstructions: "Use these tools to assist the user with their coding tasks."
+    }];
+    const mcpFsOptions = encodeMcpFileSystemOptions(true, workspacePath, mcpDescriptors);
+    parts.push(encodeMessageField(6, mcpFsOptions));
+    console.log(`[DEBUG] Added mcp_file_system_options (field 6) with workspace: ${workspacePath}`);
   }
   
   return concatBytes(...parts);
@@ -570,6 +700,346 @@ function parseKvServerMessage(data: Uint8Array): KvServerMessage {
   return result;
 }
 
+// --- Exec Message Types ---
+
+/**
+ * Parsed ExecServerMessage with mcp_args
+ */
+export interface McpExecRequest {
+  id: number;           // Execution ID - must be returned in response
+  execId?: string;      // Optional exec ID
+  name: string;         // Combined name like "opencode___bash"
+  args: Record<string, any>;  // Tool arguments
+  toolCallId: string;   // Tool call ID
+  providerIdentifier: string; // e.g., "opencode"
+  toolName: string;     // e.g., "bash"
+}
+
+/**
+ * Parse google.protobuf.Value from protobuf bytes
+ */
+function parseProtobufValue(data: Uint8Array): any {
+  const fields = parseProtoFields(data);
+  
+  for (const field of fields) {
+    // null_value = field 1 (varint, NullValue enum)
+    if (field.fieldNumber === 1 && field.wireType === 0) {
+      return null;
+    }
+    // number_value = field 2 (double, wire type 1)
+    if (field.fieldNumber === 2 && field.wireType === 1 && field.value instanceof Uint8Array) {
+      const view = new DataView(field.value.buffer, field.value.byteOffset, 8);
+      return view.getFloat64(0, true);
+    }
+    // string_value = field 3 (string)
+    if (field.fieldNumber === 3 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      return new TextDecoder().decode(field.value);
+    }
+    // bool_value = field 4 (bool)
+    if (field.fieldNumber === 4 && field.wireType === 0) {
+      return field.value === 1;
+    }
+    // struct_value = field 5 (Struct message)
+    if (field.fieldNumber === 5 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      return parseProtobufStruct(field.value);
+    }
+    // list_value = field 6 (ListValue message)
+    if (field.fieldNumber === 6 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      return parseProtobufListValue(field.value);
+    }
+  }
+  
+  return undefined;
+}
+
+/**
+ * Parse google.protobuf.Struct (map<string, Value>)
+ */
+function parseProtobufStruct(data: Uint8Array): Record<string, any> {
+  const fields = parseProtoFields(data);
+  const result: Record<string, any> = {};
+  
+  for (const field of fields) {
+    // field 1 = repeated MapEntry (fields: field 1 = key, field 2 = value)
+    if (field.fieldNumber === 1 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      const entryFields = parseProtoFields(field.value);
+      let key = "";
+      let value: any = undefined;
+      
+      for (const ef of entryFields) {
+        if (ef.fieldNumber === 1 && ef.wireType === 2 && ef.value instanceof Uint8Array) {
+          key = new TextDecoder().decode(ef.value);
+        }
+        if (ef.fieldNumber === 2 && ef.wireType === 2 && ef.value instanceof Uint8Array) {
+          value = parseProtobufValue(ef.value);
+        }
+      }
+      
+      if (key) {
+        result[key] = value;
+      }
+    }
+  }
+  
+  return result;
+}
+
+/**
+ * Parse google.protobuf.ListValue (repeated Value)
+ */
+function parseProtobufListValue(data: Uint8Array): any[] {
+  const fields = parseProtoFields(data);
+  const result: any[] = [];
+  
+  for (const field of fields) {
+    // field 1 = repeated Value
+    if (field.fieldNumber === 1 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      result.push(parseProtobufValue(field.value));
+    }
+  }
+  
+  return result;
+}
+
+/**
+ * Parse McpArgs from protobuf bytes
+ * McpArgs:
+ *   field 1: name (string)
+ *   field 2: args (map<string, google.protobuf.Value>)
+ *   field 3: tool_call_id (string)
+ *   field 4: provider_identifier (string)
+ *   field 5: tool_name (string)
+ */
+function parseMcpArgs(data: Uint8Array): Omit<McpExecRequest, 'id' | 'execId'> {
+  const fields = parseProtoFields(data);
+  let name = "";
+  const args: Record<string, any> = {};
+  let toolCallId = "";
+  let providerIdentifier = "";
+  let toolName = "";
+  
+  for (const field of fields) {
+    if (field.fieldNumber === 1 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      name = new TextDecoder().decode(field.value);
+    } else if (field.fieldNumber === 2 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      // Map entry: field 1 = key (string), field 2 = value (google.protobuf.Value)
+      const entryFields = parseProtoFields(field.value);
+      let key = "";
+      let value: any = undefined;
+      
+      for (const ef of entryFields) {
+        if (ef.fieldNumber === 1 && ef.wireType === 2 && ef.value instanceof Uint8Array) {
+          key = new TextDecoder().decode(ef.value);
+        }
+        if (ef.fieldNumber === 2 && ef.wireType === 2 && ef.value instanceof Uint8Array) {
+          value = parseProtobufValue(ef.value);
+        }
+      }
+      
+      if (key) {
+        args[key] = value;
+      }
+    } else if (field.fieldNumber === 3 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      toolCallId = new TextDecoder().decode(field.value);
+    } else if (field.fieldNumber === 4 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      providerIdentifier = new TextDecoder().decode(field.value);
+    } else if (field.fieldNumber === 5 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      toolName = new TextDecoder().decode(field.value);
+    }
+  }
+  
+  return { name, args, toolCallId, providerIdentifier, toolName };
+}
+
+/**
+ * ExecServerMessage field mapping
+ */
+const EXEC_MESSAGE_TYPES: Record<number, string> = {
+  2: "shell_args",
+  3: "write_args",
+  4: "delete_args", 
+  5: "grep_args",
+  7: "read_args",
+  8: "ls_args",
+  9: "diagnostics_args",
+  10: "request_context_args",
+  11: "mcp_args",
+  14: "shell_stream_args",
+  16: "background_shell_spawn_args",
+  17: "list_mcp_resources_exec_args",
+  18: "read_mcp_resource_exec_args",
+  20: "fetch_args",
+  21: "record_screen_args",
+  22: "computer_use_args",
+};
+
+/**
+ * Parse ExecServerMessage to extract mcp_args
+ * ExecServerMessage:
+ *   field 1: id (uint32)
+ *   field 15: exec_id (string)
+ *   field 11: mcp_args (McpArgs) - oneof message
+ */
+function parseExecServerMessage(data: Uint8Array): McpExecRequest | null {
+  const fields = parseProtoFields(data);
+  let id = 0;
+  let execId: string | undefined = undefined;
+  let mcpArgs: Omit<McpExecRequest, 'id' | 'execId'> | null = null;
+  let execType: string | null = null;
+  
+  for (const field of fields) {
+    if (field.fieldNumber === 1 && field.wireType === 0) {
+      id = field.value as number;
+    } else if (field.fieldNumber === 15 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      execId = new TextDecoder().decode(field.value);
+    } else if (field.fieldNumber === 11 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      // mcp_args
+      execType = "mcp_args";
+      mcpArgs = parseMcpArgs(field.value);
+    } else if (EXEC_MESSAGE_TYPES[field.fieldNumber] !== undefined) {
+      // Log other exec message types
+      execType = EXEC_MESSAGE_TYPES[field.fieldNumber] ?? null;
+      console.log(`[DEBUG] ExecServerMessage type: ${execType} (field ${field.fieldNumber}), id: ${id}`);
+    }
+  }
+  
+  if (mcpArgs) {
+    return { id, execId, ...mcpArgs };
+  }
+  
+  return null;
+}
+
+// --- Exec Response Builders ---
+
+/**
+ * Build McpTextContent message
+ * field 1: text (string)
+ */
+function encodeMcpTextContent(text: string): Uint8Array {
+  return encodeStringField(1, text);
+}
+
+/**
+ * Build McpToolResultContentItem with text content
+ * field 1: text (McpTextContent) - oneof content
+ */
+function encodeMcpToolResultContentItem(text: string): Uint8Array {
+  const textContent = encodeMcpTextContent(text);
+  return encodeMessageField(1, textContent);
+}
+
+/**
+ * Build McpSuccess message
+ * field 1: content (repeated McpToolResultContentItem)
+ * field 2: is_error (bool)
+ */
+function encodeMcpSuccess(content: string, isError: boolean = false): Uint8Array {
+  const parts: Uint8Array[] = [];
+  
+  // Add content item
+  const contentItem = encodeMcpToolResultContentItem(content);
+  parts.push(encodeMessageField(1, contentItem));
+  
+  // Add is_error if true
+  if (isError) {
+    parts.push(encodeBoolField(2, true));
+  }
+  
+  return concatBytes(...parts);
+}
+
+/**
+ * Build McpError message
+ * field 1: error (string)
+ */
+function encodeMcpError(error: string): Uint8Array {
+  return encodeStringField(1, error);
+}
+
+/**
+ * Build McpResult message
+ * field 1: success (McpSuccess) - oneof result
+ * field 2: error (McpError) - oneof result
+ */
+function encodeMcpResult(result: { success?: { content: string; isError?: boolean }; error?: string }): Uint8Array {
+  if (result.success) {
+    const success = encodeMcpSuccess(result.success.content, result.success.isError);
+    return encodeMessageField(1, success);
+  } else if (result.error) {
+    const error = encodeMcpError(result.error);
+    return encodeMessageField(2, error);
+  }
+  
+  // Default to empty success
+  return encodeMessageField(1, encodeMcpSuccess(""));
+}
+
+/**
+ * Build ExecClientMessage with mcp_result
+ * ExecClientMessage:
+ *   field 1: id (uint32)
+ *   field 15: exec_id (string) - optional
+ *   field 11: mcp_result (McpResult) - oneof message
+ */
+function buildExecClientMessage(
+  id: number,
+  execId: string | undefined,
+  result: { success?: { content: string; isError?: boolean }; error?: string }
+): Uint8Array {
+  const parts: Uint8Array[] = [];
+  
+  // field 1: id
+  parts.push(encodeUint32Field(1, id));
+  
+  // field 15: exec_id (optional)
+  if (execId) {
+    parts.push(encodeStringField(15, execId));
+  }
+  
+  // field 11: mcp_result
+  const mcpResult = encodeMcpResult(result);
+  parts.push(encodeMessageField(11, mcpResult));
+  
+  return concatBytes(...parts);
+}
+
+/**
+ * Build ExecClientStreamClose message
+ * field 1: id (uint32)
+ */
+function encodeExecClientStreamClose(id: number): Uint8Array {
+  return encodeUint32Field(1, id);
+}
+
+/**
+ * Build ExecClientControlMessage with stream_close
+ * ExecClientControlMessage:
+ *   field 1: stream_close (ExecClientStreamClose) - oneof message
+ */
+function buildExecClientControlMessage(id: number): Uint8Array {
+  const streamClose = encodeExecClientStreamClose(id);
+  return encodeMessageField(1, streamClose);
+}
+
+/**
+ * Build AgentClientMessage with exec_client_message
+ * AgentClientMessage:
+ *   field 2: exec_client_message (ExecClientMessage)
+ */
+function buildAgentClientMessageWithExec(execClientMessage: Uint8Array): Uint8Array {
+  return encodeMessageField(2, execClientMessage);
+}
+
+/**
+ * Build AgentClientMessage with exec_client_control_message
+ * AgentClientMessage:
+ *   field 5: exec_client_control_message (ExecClientControlMessage)
+ */
+function buildAgentClientMessageWithExecControl(execClientControlMessage: Uint8Array): Uint8Array {
+  return encodeMessageField(5, execClientControlMessage);
+}
+
 // --- Tool Call Parsing ---
 
 /**
@@ -710,11 +1180,12 @@ export interface ToolCallInfo {
 }
 
 export interface AgentStreamChunk {
-  type: "text" | "thinking" | "token" | "checkpoint" | "done" | "error" | "tool_call_started" | "tool_call_completed" | "partial_tool_call";
+  type: "text" | "thinking" | "token" | "checkpoint" | "done" | "error" | "tool_call_started" | "tool_call_completed" | "partial_tool_call" | "exec_request";
   content?: string;
   error?: string;
   toolCall?: ToolCallInfo;
   partialArgs?: string;   // For partial_tool_call updates
+  execRequest?: McpExecRequest;  // For exec_request chunks - tool execution needed
 }
 
 // --- Agent Service Client ---
@@ -738,12 +1209,18 @@ export class AgentServiceClient {
   private accessToken: string;
   private workspacePath: string;
   private blobStore: Map<string, Uint8Array>;
+  
+  // For tool result submission during streaming
+  private currentRequestId: string | null = null;
+  private currentAppendSeqno: bigint = 0n;
 
   constructor(accessToken: string, options: AgentServiceOptions = {}) {
     this.accessToken = accessToken;
+    // Use main API endpoint (api2.cursor.sh) - agent.api5.cursor.sh requires feature flag
     this.baseUrl = options.baseUrl ?? CURSOR_API_URL;
     this.workspacePath = options.workspacePath ?? process.cwd();
     this.blobStore = new Map();
+    console.log(`[DEBUG] AgentServiceClient using baseUrl: ${this.baseUrl}`);
   }
 
   private getHeaders(requestId?: string): Record<string, string> {
@@ -789,8 +1266,8 @@ export class AgentServiceClient {
     const userMessageAction = encodeUserMessageAction(userMessage, requestContext);
     const conversationAction = encodeConversationAction(userMessageAction);
     const modelDetails = encodeModelDetails(model);
-    // Pass tools to AgentRunRequest (field 4: mcp_tools)
-    const agentRunRequest = encodeAgentRunRequest(conversationAction, modelDetails, conversationId, request.tools);
+    // Pass tools to AgentRunRequest (field 4: mcp_tools) and workspace path (for field 6: mcp_file_system_options)
+    const agentRunRequest = encodeAgentRunRequest(conversationAction, modelDetails, conversationId, request.tools, this.workspacePath);
     const agentClientMessage = encodeAgentClientMessage(agentRunRequest);
 
     return agentClientMessage;
@@ -841,6 +1318,18 @@ export class AgentServiceClient {
       const key = this.blobIdToKey(kvMsg.blobId);
       this.blobStore.set(key, kvMsg.blobData);
       
+      // Debug: try to decode blob data as text to see what it contains
+      try {
+        const text = new TextDecoder().decode(kvMsg.blobData);
+        if (text.length < 500) {
+          console.log(`[DEBUG] Blob data (text): ${text.slice(0, 200)}`);
+        } else {
+          console.log(`[DEBUG] Blob data (${kvMsg.blobData.length} bytes, first 200 chars): ${text.slice(0, 200)}`);
+        }
+      } catch {
+        console.log(`[DEBUG] Blob data (${kvMsg.blobData.length} bytes, non-text)`);
+      }
+      
       // SetBlobResult: empty = no error
       const result = new Uint8Array(0);
       const kvClientMsg = buildKvClientMessage(kvMsg.id, 'set_blob_result', result);
@@ -850,6 +1339,44 @@ export class AgentServiceClient {
       return appendSeqno + 1n;
     }
     return appendSeqno;
+  }
+
+  /**
+   * Send a tool result back to the server
+   * This must be called during an active chat stream when an exec_request chunk is received
+   */
+  async sendToolResult(
+    execRequest: McpExecRequest,
+    result: { success?: { content: string; isError?: boolean }; error?: string }
+  ): Promise<void> {
+    if (!this.currentRequestId) {
+      throw new Error("No active chat stream - cannot send tool result");
+    }
+    
+    console.log("[DEBUG] Sending tool result for exec id:", execRequest.id, "result:", result.success ? "success" : "error");
+    
+    // Build ExecClientMessage with mcp_result
+    const execClientMsg = buildExecClientMessage(
+      execRequest.id,
+      execRequest.execId,
+      result
+    );
+    const responseMsg = buildAgentClientMessageWithExec(execClientMsg);
+    
+    // Send the result
+    await this.bidiAppend(this.currentRequestId, this.currentAppendSeqno, responseMsg);
+    this.currentAppendSeqno++;
+    
+    console.log("[DEBUG] Tool result sent, new seqno:", this.currentAppendSeqno);
+    
+    // Send stream close control message
+    const controlMsg = buildExecClientControlMessage(execRequest.id);
+    const controlResponseMsg = buildAgentClientMessageWithExecControl(controlMsg);
+    
+    await this.bidiAppend(this.currentRequestId, this.currentAppendSeqno, controlResponseMsg);
+    this.currentAppendSeqno++;
+    
+    console.log("[DEBUG] Stream close sent for exec id:", execRequest.id);
   }
 
   /**
@@ -946,6 +1473,10 @@ export class AgentServiceClient {
     const messageBody = this.buildChatMessage(request);
     let appendSeqno = 0n;
 
+    // Store for tool result submission
+    this.currentRequestId = requestId;
+    this.currentAppendSeqno = 0n;
+
     // Build BidiRequestId message for RunSSE
     const bidiRequestId = encodeBidiRequestId(requestId);
     const envelope = addConnectEnvelope(bidiRequestId);
@@ -966,6 +1497,7 @@ export class AgentServiceClient {
 
       // Send initial message
       await this.bidiAppend(requestId, appendSeqno++, messageBody);
+      this.currentAppendSeqno = appendSeqno;
 
       const sseResponse = await ssePromise;
 
@@ -1093,7 +1625,21 @@ export class AgentServiceClient {
                 }
                 
                 // field 3 = conversation_checkpoint_update (completion signal)
-                if (field.fieldNumber === 3 && field.wireType === 2) {
+                if (field.fieldNumber === 3 && field.wireType === 2 && field.value instanceof Uint8Array) {
+                  console.log("[DEBUG] Received checkpoint, data length:", field.value.length);
+                  // Try to parse checkpoint to see what it contains
+                  const checkpointFields = parseProtoFields(field.value);
+                  console.log("[DEBUG] Checkpoint fields:", checkpointFields.map(f => `field${f.fieldNumber}:${f.wireType}`).join(", "));
+                  for (const cf of checkpointFields) {
+                    if (cf.wireType === 2 && cf.value instanceof Uint8Array) {
+                      try {
+                        const text = new TextDecoder().decode(cf.value);
+                        if (text.length < 200) {
+                          console.log(`[DEBUG] Checkpoint field ${cf.fieldNumber}: ${text}`);
+                        }
+                      } catch {}
+                    }
+                  }
                   yield { type: "checkpoint" };
                   turnEnded = true;
                 }
@@ -1101,16 +1647,38 @@ export class AgentServiceClient {
                 // field 2 = exec_server_message (tool execution request)
                 if (field.fieldNumber === 2 && field.wireType === 2 && field.value instanceof Uint8Array) {
                   console.log("[DEBUG] Received exec_server_message (field 2), length:", field.value.length);
-                  // Parse the ExecServerMessage to see what tool is being called
-                  const execFields = parseProtoFields(field.value);
-                  console.log("[DEBUG] exec_server_message fields:", execFields.map(f => `field${f.fieldNumber}`).join(", "));
-                  // TODO: Handle exec_server_message by executing the tool and sending response
+                  
+                  // Parse the ExecServerMessage to extract mcp_args
+                  const execRequest = parseExecServerMessage(field.value);
+                  
+                  if (execRequest) {
+                    console.log("[DEBUG] Parsed MCP exec request:", {
+                      id: execRequest.id,
+                      name: execRequest.name,
+                      toolName: execRequest.toolName,
+                      providerIdentifier: execRequest.providerIdentifier,
+                      toolCallId: execRequest.toolCallId,
+                      args: execRequest.args,
+                    });
+                    
+                    // Yield exec_request chunk for the server to handle
+                    yield {
+                      type: "exec_request",
+                      execRequest,
+                    };
+                  } else {
+                    // Log other exec types we don't handle yet
+                    const execFields = parseProtoFields(field.value);
+                    console.log("[DEBUG] exec_server_message fields (non-MCP):", execFields.map(f => `field${f.fieldNumber}`).join(", "));
+                  }
                 }
                 
                 // field 4 = kv_server_message
                 if (field.fieldNumber === 4 && field.wireType === 2 && field.value instanceof Uint8Array) {
                   const kvMsg = parseKvServerMessage(field.value);
+                  console.log(`[DEBUG] KV message: id=${kvMsg.id}, type=${kvMsg.messageType}, blobId=${kvMsg.blobId ? Buffer.from(kvMsg.blobId).toString('hex').slice(0, 20) : 'none'}...`);
                   appendSeqno = await this.handleKvMessage(kvMsg, requestId, appendSeqno);
+                  this.currentAppendSeqno = appendSeqno;
                 }
               } catch (parseErr: any) {
                 console.error("Error parsing field:", field.fieldNumber, parseErr);
@@ -1130,9 +1698,11 @@ export class AgentServiceClient {
       } finally {
         reader.releaseLock();
         clearTimeout(timeout);
+        this.currentRequestId = null;
       }
     } catch (err: any) {
       clearTimeout(timeout);
+      this.currentRequestId = null;
       if (err.name === 'AbortError') {
         // Normal termination after turn ended
         return;
