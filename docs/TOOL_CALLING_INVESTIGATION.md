@@ -962,15 +962,73 @@ function extractTextFromContent(content: any): string {
 - Fragile - depends on KV blob format staying consistent
 - May have edge cases with partial content
 
-#### Option C: Find the Continue Signal (Ideal) - NOT FOUND
+#### Option C: Find the Continue Signal (Ideal) - THOROUGHLY INVESTIGATED
 
-Investigated whether there's a message that triggers streaming instead of KV storage. **Conclusion: No such signal found.**
+Investigated whether there's a message that triggers streaming instead of KV storage. **Conclusion: No such signal exists, but deeper analysis reveals potential issues with our BidiAppend implementation.**
 
-**Investigation Results:**
-- `ConversationAction` has `ResumeAction` (field 2) but it's for connection loss recovery, not continuation
-- `ExecClientControlMessage` only has `stream_close` and `throw` - no "continue" option
-- Native Cursor client appears to use KV blobs for this flow (IDE renders from blobs)
-- The KV storage behavior seems intentional for checkpoint/resume functionality
+**All ConversationAction Types Found:**
+| Field # | Name | Purpose |
+|---------|------|---------|
+| 1 | `user_message_action` | User sends a new message |
+| 2 | `resume_action` | Resume after connection loss ONLY |
+| 3 | `cancel_action` | Cancel current operation |
+| 4 | `summarize_action` | Request conversation summary |
+| 5 | `shell_command_action` | Execute shell command |
+| 6 | `start_plan_action` | Start planning mode |
+| 7 | `execute_plan_action` | Execute a plan |
+| 8 | `async_ask_question_completion_action` | Complete async question |
+
+**ResumeAction Details:**
+```javascript
+// ResumeAction only contains request_context - used for reconnection only
+ResumeAction.fields = [{
+  no: 2,
+  name: "request_context",
+  kind: "message",
+  T: RequestContext
+}];
+```
+
+**Key Findings:**
+1. **No "continue" signal exists** - The backend AUTOMATICALLY continues generating when it receives tool results
+2. **ResumeAction is ONLY for connection loss recovery** - NOT for post-tool continuation
+3. **KV blobs are for checkpointing, NOT streaming** - Text should come via `InteractionUpdate.textDelta`
+4. **Native flow expects stream to stay open** - Server pauses, waits for results, then resumes text generation
+
+**The Expected Native Flow:**
+```
+Client                                     Server
+  |                                          |
+  |--- Initial Request ---------------------->|
+  |<--- InteractionUpdate (text_delta) -------|  Text streaming
+  |<--- ExecServerMessage (tool request) -----|  Tool call
+  |                                          |
+  |   [Server PAUSES text generation]        |
+  |                                          |
+  |--- ExecClientMessage (tool result) ------>|
+  |--- ExecClientControlMessage (close) ----->|
+  |                                          |
+  |   [Server RESUMES automatically]         |
+  |                                          |
+  |<--- InteractionUpdate (text_delta) -------|  More text
+  |<--- InteractionUpdate (turn_ended) -------|  Done
+```
+
+**Why Our BidiAppend Flow Might Be Broken:**
+1. **Stream lifecycle issue** - SSE stream might be closing after receiving heartbeats
+2. **Message ordering** - `append_seqno` might be incorrect, causing server to wait
+3. **Request context mismatch** - Tool result might be missing required context
+4. **State mismatch** - Checkpoint sent with tool result doesn't match server expectation
+
+**Potential Fix (Option C-fix):**
+If we want to debug further, we should:
+1. Capture what native Cursor CLI sends for tool results (exact protobuf bytes)
+2. Compare with our implementation
+3. Verify SSE stream doesn't close prematurely (increase heartbeat tolerance)
+4. Check `append_seqno` is correctly incremented after KV messages
+5. Ensure the same `request_id` is used consistently
+
+However, since Option A (fresh sessions) works reliably and matches standard OpenAI behavior, it's the pragmatic choice for now.
 
 ### Test Commands
 
