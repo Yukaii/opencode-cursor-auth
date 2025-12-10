@@ -1,5 +1,16 @@
 # OpenCode Cursor Auth
 
+> **⚠️ Experimental Project - Use at Your Own Risk**
+>
+> This is a highly experimental project with limited support. It was built by reverse-engineering Cursor's internal API, which means:
+>
+> - **It may break at any time** without notice if Cursor changes their API
+> - **No guarantees** of stability, compatibility, or continued functionality
+> - **"It Works On My Machine™"** - your mileage may vary
+> - **Not affiliated with or endorsed by Cursor** - this is an unofficial community project
+>
+> If it stops working, feel free to open an issue, but fixes depend on community contributions and reverse-engineering efforts.
+
 An OpenAI-compatible proxy server that routes requests through Cursor's AI backend, enabling any OpenAI-compatible client (including OpenCode) to use Cursor's API with full tool calling support.
 
 ## Features
