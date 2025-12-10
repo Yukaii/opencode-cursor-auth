@@ -109,6 +109,9 @@ describe("tool result forwarding", () => {
         async sendGrepResult() {
           throw new Error("unexpected grep");
         },
+        async sendWriteResult() {
+          throw new Error("unexpected write");
+        },
       },
     };
 
@@ -144,6 +147,7 @@ describe("tool result forwarding", () => {
         async sendReadResult() { throw new Error("unexpected"); },
         async sendLsResult() { throw new Error("unexpected"); },
         async sendGrepResult() { throw new Error("unexpected"); },
+        async sendWriteResult() { throw new Error("unexpected"); },
       },
     };
 
@@ -186,6 +190,9 @@ describe("tool result forwarding", () => {
           throw new Error("unexpected");
         },
         async sendGrepResult() {
+          throw new Error("unexpected");
+        },
+        async sendWriteResult() {
           throw new Error("unexpected");
         },
       },

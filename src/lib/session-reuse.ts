@@ -26,6 +26,7 @@ export interface SessionLike {
     sendReadResult: SessionClient["sendReadResult"];
     sendLsResult: SessionClient["sendLsResult"];
     sendGrepResult: SessionClient["sendGrepResult"];
+    sendWriteResult: SessionClient["sendWriteResult"];
   };
 }
 
@@ -60,6 +61,14 @@ export interface SessionClient {
     pattern: string,
     path: string,
     files: string[]
+  ) => Promise<void>;
+  sendWriteResult: (
+    id: number,
+    execId: string | undefined,
+    result: { 
+      success?: { path: string; linesCreated: number; fileSize: number; fileContentAfterWrite?: string }; 
+      error?: { path: string; error: string };
+    }
   ) => Promise<void>;
 }
 
@@ -152,6 +161,9 @@ export function mapExecRequestToTool(execReq: ExecRequest): {
   if (execReq.type === "mcp") {
     return { toolName: execReq.toolName, toolArgs: execReq.args };
   }
+  if (execReq.type === "write") {
+    return { toolName: "write", toolArgs: { filePath: execReq.path, content: execReq.fileText } };
+  }
   return { toolName: null, toolArgs: null };
 }
 
@@ -220,6 +232,25 @@ export async function sendToolResultsToCursor(
         const pattern = execReq.glob ?? execReq.pattern ?? "";
         const path = execReq.path ?? process.cwd();
         await session.client.sendGrepResult(execReq.id, execReq.execId, pattern, path, files);
+      } else if (execReq.type === "write") {
+        // Parse write result from tool response
+        const parsed = safeParseJson(content);
+        if (parsed && parsed.error) {
+          await session.client.sendWriteResult(execReq.id, execReq.execId, {
+            error: { path: execReq.path, error: parsed.error }
+          });
+        } else {
+          const linesCreated = parsed?.linesCreated ?? content.split("\n").length;
+          const fileSize = parsed?.fileSize ?? content.length;
+          await session.client.sendWriteResult(execReq.id, execReq.execId, {
+            success: { 
+              path: execReq.path, 
+              linesCreated, 
+              fileSize,
+              fileContentAfterWrite: parsed?.fileContentAfterWrite
+            }
+          });
+        }
       } else {
         return false;
       }

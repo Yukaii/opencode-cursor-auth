@@ -768,6 +768,26 @@ export interface GrepExecRequest {
 }
 
 /**
+ * Write file request
+ * WriteArgs:
+ *   field 1: path (string)
+ *   field 2: file_text (string)
+ *   field 3: tool_call_id (string)
+ *   field 4: return_file_content_after_write (bool)
+ *   field 5: file_bytes (bytes)
+ */
+export interface WriteExecRequest {
+  type: 'write';
+  id: number;
+  execId?: string;
+  path: string;
+  fileText: string;
+  toolCallId?: string;
+  returnFileContentAfterWrite?: boolean;
+  fileBytes?: Uint8Array;
+}
+
+/**
  * Union type for all exec requests
  */
 export type ExecRequest =
@@ -776,7 +796,8 @@ export type ExecRequest =
   | LsExecRequest
   | RequestContextExecRequest
   | ReadExecRequest
-  | GrepExecRequest;
+  | GrepExecRequest
+  | WriteExecRequest;
 
 /**
  * Parse google.protobuf.Value from protobuf bytes
@@ -1021,6 +1042,46 @@ function parseGrepArgs(data: Uint8Array): { pattern: string; path?: string; glob
 }
 
 /**
+ * Parse write_args
+ * WriteArgs:
+ *   field 1: path (string)
+ *   field 2: file_text (string)
+ *   field 3: tool_call_id (string)
+ *   field 4: return_file_content_after_write (bool)
+ *   field 5: file_bytes (bytes)
+ */
+function parseWriteArgs(data: Uint8Array): { 
+  path: string; 
+  fileText: string; 
+  toolCallId?: string;
+  returnFileContentAfterWrite?: boolean;
+  fileBytes?: Uint8Array;
+} {
+  const fields = parseProtoFields(data);
+  let path = '';
+  let fileText = '';
+  let toolCallId: string | undefined;
+  let returnFileContentAfterWrite: boolean | undefined;
+  let fileBytes: Uint8Array | undefined;
+
+  for (const field of fields) {
+    if (field.fieldNumber === 1 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      path = new TextDecoder().decode(field.value);
+    } else if (field.fieldNumber === 2 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      fileText = new TextDecoder().decode(field.value);
+    } else if (field.fieldNumber === 3 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      toolCallId = new TextDecoder().decode(field.value);
+    } else if (field.fieldNumber === 4 && field.wireType === 0) {
+      returnFileContentAfterWrite = field.value === 1;
+    } else if (field.fieldNumber === 5 && field.wireType === 2 && field.value instanceof Uint8Array) {
+      fileBytes = field.value;
+    }
+  }
+
+  return { path, fileText, toolCallId, returnFileContentAfterWrite, fileBytes };
+}
+
+/**
  * Parse ExecServerMessage to extract all exec types
  * ExecServerMessage:
  *   field 1: id (uint32)
@@ -1055,6 +1116,20 @@ function parseExecServerMessage(data: Uint8Array): ExecRequest | null {
       case 14: { // shell_stream_args
         const shellArgs = parseShellArgs(field.value);
         result = { type: 'shell', id, execId, command: shellArgs.command, cwd: shellArgs.cwd };
+        break;
+      }
+      case 3: { // write_args
+        const writeArgs = parseWriteArgs(field.value);
+        result = { 
+          type: 'write', 
+          id, 
+          execId, 
+          path: writeArgs.path, 
+          fileText: writeArgs.fileText,
+          toolCallId: writeArgs.toolCallId,
+          returnFileContentAfterWrite: writeArgs.returnFileContentAfterWrite,
+          fileBytes: writeArgs.fileBytes
+        };
         break;
       }
       case 5: { // grep_args (also used for glob)
@@ -1520,6 +1595,91 @@ function buildExecClientMessageWithGrepResult(
     parts.push(encodeStringField(15, execId));
   }
   parts.push(encodeMessageField(5, encodeGrepResult(pattern, path, files)));
+  return concatBytes(...parts);
+}
+
+/**
+ * Build WriteSuccess message
+ * WriteSuccess:
+ *   field 1: path (string)
+ *   field 2: lines_created (int32)
+ *   field 3: file_size (int32)
+ *   field 4: file_content_after_write (string, optional)
+ */
+function encodeWriteSuccess(path: string, linesCreated: number, fileSize: number, fileContentAfterWrite?: string): Uint8Array {
+  const parts: Uint8Array[] = [];
+  parts.push(encodeStringField(1, path));
+  parts.push(encodeInt32Field(2, linesCreated));
+  parts.push(encodeInt32Field(3, fileSize));
+  if (fileContentAfterWrite) {
+    parts.push(encodeStringField(4, fileContentAfterWrite));
+  }
+  return concatBytes(...parts);
+}
+
+/**
+ * Build WriteError message
+ * WriteError:
+ *   field 1: path (string)
+ *   field 2: error (string)
+ */
+function encodeWriteError(path: string, error: string): Uint8Array {
+  return concatBytes(
+    encodeStringField(1, path),
+    encodeStringField(2, error)
+  );
+}
+
+/**
+ * Build WriteResult message
+ * WriteResult:
+ *   field 1: success (WriteSuccess) - oneof result
+ *   field 3: permission_denied (WritePermissionDenied) - oneof result  
+ *   field 4: no_space (WriteNoSpace) - oneof result
+ *   field 5: error (WriteError) - oneof result
+ *   field 6: rejected (WriteRejected) - oneof result
+ */
+function encodeWriteResult(result: { 
+  success?: { path: string; linesCreated: number; fileSize: number; fileContentAfterWrite?: string }; 
+  error?: { path: string; error: string };
+}): Uint8Array {
+  if (result.success) {
+    const success = encodeWriteSuccess(
+      result.success.path, 
+      result.success.linesCreated, 
+      result.success.fileSize,
+      result.success.fileContentAfterWrite
+    );
+    return encodeMessageField(1, success);
+  } else if (result.error) {
+    const error = encodeWriteError(result.error.path, result.error.error);
+    return encodeMessageField(5, error);
+  }
+  // Default to empty success
+  return encodeMessageField(1, encodeWriteSuccess("", 0, 0));
+}
+
+/**
+ * Build ExecClientMessage with write_result
+ * ExecClientMessage:
+ *   field 1: id (uint32)
+ *   field 15: exec_id (string) - optional
+ *   field 3: write_result (WriteResult) - oneof message
+ */
+function buildExecClientMessageWithWriteResult(
+  id: number,
+  execId: string | undefined,
+  result: { 
+    success?: { path: string; linesCreated: number; fileSize: number; fileContentAfterWrite?: string }; 
+    error?: { path: string; error: string };
+  }
+): Uint8Array {
+  const parts: Uint8Array[] = [];
+  parts.push(encodeUint32Field(1, id));
+  if (execId) {
+    parts.push(encodeStringField(15, execId));
+  }
+  parts.push(encodeMessageField(3, encodeWriteResult(result)));
   return concatBytes(...parts);
 }
 
@@ -2121,6 +2281,39 @@ export class AgentServiceClient {
     console.log("[DEBUG] Sending grep result for id:", id, "pattern:", pattern, "files:", files.length);
 
     const execClientMsg = buildExecClientMessageWithGrepResult(id, execId, pattern, path, files);
+    const responseMsg = buildAgentClientMessageWithExec(execClientMsg);
+
+    await this.bidiAppend(this.currentRequestId, this.currentAppendSeqno, responseMsg);
+    this.currentAppendSeqno++;
+
+    // Send stream close control message
+    const controlMsg = buildExecClientControlMessage(id);
+    const controlResponseMsg = buildAgentClientMessageWithExecControl(controlMsg);
+
+    await this.bidiAppend(this.currentRequestId, this.currentAppendSeqno, controlResponseMsg);
+    this.currentAppendSeqno++;
+
+    console.log("[DEBUG] Stream close sent for exec id:", id);
+  }
+
+  /**
+   * Send a file write result back to the server
+   */
+  async sendWriteResult(
+    id: number,
+    execId: string | undefined,
+    result: { 
+      success?: { path: string; linesCreated: number; fileSize: number; fileContentAfterWrite?: string }; 
+      error?: { path: string; error: string };
+    }
+  ): Promise<void> {
+    if (!this.currentRequestId) {
+      throw new Error("No active chat stream - cannot send write result");
+    }
+
+    console.log("[DEBUG] Sending write result for id:", id, "result:", result.success ? "success" : "error");
+
+    const execClientMsg = buildExecClientMessageWithWriteResult(id, execId, result);
     const responseMsg = buildAgentClientMessageWithExec(execClientMsg);
 
     await this.bidiAppend(this.currentRequestId, this.currentAppendSeqno, responseMsg);
