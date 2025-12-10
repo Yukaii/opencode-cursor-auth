@@ -1,7 +1,13 @@
 {
   "name": "opencode-cursor-auth",
   "version": "0.1.0",
-  "description": "OpenCode authentication plugin for Cursor's AI backend, enabling direct access to Cursor's API through OpenCode",
+  "description": "OpenAI-compatible proxy server for Cursor's AI backend with full tool calling support",
+  "author": "Yukai Huang",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Yukaii/opencode-cursor-auth"
+  },
   "module": "src/index.ts",
   "main": "src/index.ts",
   "type": "module",
@@ -28,22 +34,28 @@
     }
   },
   "scripts": {
+    "start": "bun run src/server.ts",
+    "server": "bun run src/server.ts",
+    "proxy": "bun run src/server.ts",
     "demo": "bun run scripts/auth-demo.ts",
     "demo:status": "bun run scripts/auth-demo.ts status",
     "demo:login": "bun run scripts/auth-demo.ts login",
     "demo:logout": "bun run scripts/auth-demo.ts logout",
-    "server": "bun run src/server.ts",
-    "proxy": "bun run src/server.ts",
+    "models": "bun run scripts/fetch-models.ts",
     "test": "bun test"
   },
   "keywords": [
     "cursor",
     "opencode",
-    "auth",
-    "authentication",
     "openai",
     "api",
-    "plugin"
+    "proxy",
+    "llm",
+    "ai",
+    "tool-calling",
+    "streaming",
+    "claude",
+    "gpt"
   ],
   "devDependencies": {
     "@opencode-ai/plugin": "^0.13.7",
