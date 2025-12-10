@@ -32,6 +32,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Finder (MacOS) folder config
 .DS_Store
 
+# Cursor CLI source code (restored from bundles - keep local only)
 cursor-agent-source
+cursor-agent-restored-source-code
+
 /dist
 !.opencode
