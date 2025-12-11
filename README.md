@@ -58,7 +58,17 @@ That's it! The plugin will:
 
 ### 3. Authenticate
 
-Run OpenCode and authenticate via the auth menu (`ctrl+p` → auth → Cursor → OAuth).
+Run OpenCode and authenticate:
+
+```
+opencode auth login
+```
+
+Then:
+1. Select **"other"** from the provider list
+2. Type **"cursor"** as the provider name
+3. Select **"OAuth with Cursor"**
+4. Complete the browser-based OAuth flow
 
 ## Standalone Server Usage
 
