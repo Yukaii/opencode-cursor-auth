@@ -6,45 +6,11 @@
  */
 
 import { randomUUID, createHash } from "node:crypto";
-import { loadUnifiedExports } from "../proto/unified-loader";
 
 // --- Constants ---
 
 export const CURSOR_API_URL = "https://api2.cursor.sh";
 export const CURSOR_CHAT_ENDPOINT = "/aiserver.v1.AiService/StreamChat";
-export const CURSOR_UNIFIED_CHAT_ENDPOINT =
-  "/aiserver.v1.AiService/StreamUnifiedChatWithTools";
-
-type UnifiedDeps = {
-  ConversationMessage?: any;
-  ConversationMessage_MessageType?: any;
-  StreamUnifiedChatRequest?: any;
-  StreamUnifiedChatRequestWithTools?: any;
-  StreamUnifiedChatRequest_UnifiedMode?: any;
-  StreamUnifiedChatResponse?: any;
-  ModelDetails?: any;
-};
-
-let unifiedDepsPromise: Promise<UnifiedDeps | null> | null = null;
-
-async function loadUnifiedDeps(): Promise<UnifiedDeps | null> {
-  if (unifiedDepsPromise) {
-    return unifiedDepsPromise;
-  }
-
-  unifiedDepsPromise = (async () => {
-    try {
-      const exports = await loadUnifiedExports();
-      if (!exports) return null;
-      return exports as UnifiedDeps;
-    } catch (error) {
-      console.warn("Failed to load unified proto bundle:", error);
-      return null;
-    }
-  })();
-
-  return unifiedDepsPromise;
-}
 
 // --- Types ---
 
@@ -248,59 +214,6 @@ export function encodeChatRequest(request: ChatRequest): Uint8Array {
 }
 
 /**
- * Build a StreamUnifiedChatRequestWithTools message from a simplified ChatRequest.
- */
-async function buildUnifiedChatRequest(
-  request: ChatRequest
-): Promise<Uint8Array | null> {
-  const deps = await loadUnifiedDeps();
-  if (!deps) {
-    return null;
-  }
-
-  const {
-    ConversationMessage,
-    ConversationMessage_MessageType,
-    StreamUnifiedChatRequest,
-    StreamUnifiedChatRequestWithTools,
-    StreamUnifiedChatRequest_UnifiedMode,
-    ModelDetails,
-  } = deps;
-
-  const systemMessage = request.messages.find((m) => m.role === "system");
-  const chatMessages = request.messages.filter((m) => m.role !== "system");
-
-  const conversation = chatMessages.map(
-    (msg) =>
-      new ConversationMessage({
-        text: msg.content,
-        type:
-          msg.role === "assistant"
-            ? ConversationMessage_MessageType.AI
-            : ConversationMessage_MessageType.HUMAN,
-      })
-  );
-
-  const unified = new StreamUnifiedChatRequest({
-    conversation,
-    isChat: true,
-    conversationId: randomUUID(),
-    modelDetails: ModelDetails ? new ModelDetails({ modelName: request.model }) : undefined,
-    useUnifiedChatPrompt: true,
-    shouldUseChatPrompt: true,
-    unifiedMode: StreamUnifiedChatRequest_UnifiedMode.CHAT,
-  });
-
-  if (systemMessage?.content) {
-    unified.customPlanningInstructions = systemMessage.content;
-  }
-
-  return new StreamUnifiedChatRequestWithTools({
-    streamUnifiedChatRequest: unified,
-  }).toBinary();
-}
-
-/**
  * Add Connect-RPC envelope (5-byte header)
  * Format: [flags: 1 byte][length: 4 bytes big-endian][payload]
  */
@@ -418,61 +331,6 @@ export function parseStreamChunks(buffer: Uint8Array): StreamChunk[] {
     // Normal message - decode as ResMessage
     try {
       const content = decodeResMessage(messageData);
-      if (content) {
-        chunks.push({ type: "delta", content });
-      }
-    } catch {
-      // Skip malformed messages
-    }
-  }
-
-  return chunks;
-}
-
-/**
- * Parse Connect-RPC streaming response chunks for StreamUnifiedChat.
- */
-export function parseUnifiedStreamChunks(
-  buffer: Uint8Array,
-  deps: UnifiedDeps
-): StreamChunk[] {
-  const chunks: StreamChunk[] = [];
-  let offset = 0;
-
-  while (offset + 5 <= buffer.length) {
-    const flags = buffer[offset];
-    const length =
-      (buffer[offset + 1]! << 24) |
-      (buffer[offset + 2]! << 16) |
-      (buffer[offset + 3]! << 8) |
-      buffer[offset + 4]!;
-
-    offset += 5;
-
-    if (offset + length > buffer.length) {
-      break;
-    }
-
-    const messageData = buffer.slice(offset, offset + length);
-    offset += length;
-
-    if (flags === 0x02) {
-      try {
-        const errorText = new TextDecoder().decode(messageData);
-        chunks.push({ type: "error", error: errorText });
-      } catch {
-        chunks.push({ type: "error", error: "Unknown error" });
-      }
-      continue;
-    }
-
-    try {
-      const decoded = deps.StreamUnifiedChatResponse.fromBinary(messageData);
-      const content =
-        decoded.text ||
-        decoded.intermediateText ||
-        decoded.filledPrompt ||
-        "";
       if (content) {
         chunks.push({ type: "delta", content });
       }
@@ -619,47 +477,6 @@ export class CursorClient {
   }
 
   /**
-   * Send a chat completion request using the unified chat proto (non-streaming).
-   */
-  async unifiedChat(request: ChatRequest): Promise<string> {
-    const unifiedRequest = await buildUnifiedChatRequest(request);
-    if (!unifiedRequest) {
-      throw new Error("Unified chat protos unavailable");
-    }
-    const deps = await loadUnifiedDeps();
-    if (!deps) {
-      throw new Error("Unified chat protos unavailable");
-    }
-    const envelope = addConnectEnvelope(unifiedRequest);
-
-    const response = await fetch(`${this.baseUrl}${CURSOR_UNIFIED_CHAT_ENDPOINT}`, {
-      method: "POST",
-      headers: this.getHeaders(),
-      body: Buffer.from(envelope),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Cursor unified API error: ${response.status} - ${errorText}`);
-    }
-
-    const buffer = new Uint8Array(await response.arrayBuffer());
-    const chunks = parseUnifiedStreamChunks(buffer, deps);
-
-    let result = "";
-    for (const chunk of chunks) {
-      if (chunk.type === "error") {
-        throw new Error(chunk.error ?? "Unknown unified error");
-      }
-      if (chunk.type === "delta" && chunk.content) {
-        result += chunk.content;
-      }
-    }
-
-    return result;
-  }
-  
-  /**
    * Send a streaming chat completion request
    */
   async *chatStream(request: ChatRequest): AsyncGenerator<StreamChunk> {
@@ -714,68 +531,6 @@ export class CursorClient {
         
         // Note: In a production implementation, we'd track how much was consumed
         // and keep the remaining partial message in the buffer
-      }
-    } finally {
-      reader.releaseLock();
-    }
-  }
-
-  /**
-   * Send a streaming unified chat completion request.
-   */
-  async *unifiedChatStream(request: ChatRequest): AsyncGenerator<StreamChunk> {
-    const unifiedRequest = await buildUnifiedChatRequest(request);
-    if (!unifiedRequest) {
-      throw new Error("Unified chat protos unavailable");
-    }
-    const deps = await loadUnifiedDeps();
-    if (!deps) {
-      throw new Error("Unified chat protos unavailable");
-    }
-    const envelope = addConnectEnvelope(unifiedRequest);
-
-    const response = await fetch(`${this.baseUrl}${CURSOR_UNIFIED_CHAT_ENDPOINT}`, {
-      method: "POST",
-      headers: this.getHeaders(),
-      body: Buffer.from(envelope),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Cursor unified API error: ${response.status} - ${errorText}`);
-    }
-
-    if (!response.body) {
-      throw new Error("No response body");
-    }
-
-    const reader = response.body.getReader();
-    let buffer = new Uint8Array(0);
-
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-
-        if (done) {
-          if (buffer.length > 0) {
-            const chunks = parseUnifiedStreamChunks(buffer, deps);
-            for (const chunk of chunks) {
-              yield chunk;
-            }
-          }
-          yield { type: "done" };
-          break;
-        }
-
-        const newBuffer = new Uint8Array(buffer.length + value.length);
-        newBuffer.set(buffer);
-        newBuffer.set(value, buffer.length);
-        buffer = newBuffer;
-
-        const chunks = parseUnifiedStreamChunks(buffer, deps);
-        for (const chunk of chunks) {
-          yield chunk;
-        }
       }
     } finally {
       reader.releaseLock();

@@ -131,21 +131,7 @@ async function streamCursorAsOpenAI(
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       try {
-        const chunkStream = (async function* () {
-          try {
-            for await (const chunk of client.unifiedChatStream(chatRequest)) {
-              yield chunk;
-            }
-            return;
-          } catch (error) {
-            console.warn("Unified chat stream failed, falling back to legacy:", error);
-          }
-          for await (const chunk of client.chatStream(chatRequest)) {
-            yield chunk;
-          }
-        })();
-
-        for await (const chunk of chunkStream) {
+        for await (const chunk of client.chatStream(chatRequest)) {
           if (chunk.type === "delta" && chunk.content) {
             const payload = {
               id: `cursor-${streamId}`,
@@ -270,13 +256,7 @@ export async function handleOpenAIChatCompletions(
       return await streamCursorAsOpenAI(client, chatRequest);
     }
 
-    let content: string;
-    try {
-      content = await client.unifiedChat(chatRequest);
-    } catch (error) {
-      console.warn("Unified chat request failed, falling back to legacy:", error);
-      content = await client.chat(chatRequest);
-    }
+    const content = await client.chat(chatRequest);
     const responsePayload = {
       id: `cursor-${randomUUID()}`,
       object: "chat.completion",

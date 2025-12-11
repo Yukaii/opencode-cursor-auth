@@ -32,7 +32,7 @@ async function main() {
     console.log("\n--- Response Stream ---");
     let fullText = "";
     
-    for await (const chunk of client.unifiedChatStream(request)) {
+    for await (const chunk of client.chatStream(request)) {
       if (chunk.type === "delta" && chunk.content) {
         process.stdout.write(chunk.content);
         fullText += chunk.content;
