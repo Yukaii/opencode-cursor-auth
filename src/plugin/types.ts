@@ -80,7 +80,8 @@ export type TokenExchangeResult = TokenExchangeSuccess | TokenExchangeFailure;
 export interface OAuthAuthMethod {
   label: string;
   type: "oauth";
-  authorize: () => Promise<{
+  prompts?: AuthPrompt[];
+  authorize: (inputs?: Record<string, string>) => Promise<{
     url: string;
     instructions: string;
     method: "auto" | "code";
@@ -88,10 +89,24 @@ export interface OAuthAuthMethod {
   }>;
 }
 
+export interface AuthPrompt {
+  type: "text" | "select";
+  key: string;
+  message: string;
+  placeholder?: string;
+  validate?: (value: string) => string | undefined;
+  condition?: (inputs: Record<string, string>) => boolean;
+  options?: Array<{ label: string; value: string; hint?: string }>;
+}
+
 export interface ApiKeyAuthMethod {
-  provider?: string;
   label: string;
   type: "api";
+  prompts?: AuthPrompt[];
+  authorize?: (inputs?: Record<string, string>) => Promise<
+    | { type: "success"; key: string; provider?: string }
+    | { type: "failed" }
+  >;
 }
 
 export type AuthMethod = OAuthAuthMethod | ApiKeyAuthMethod;

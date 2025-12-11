@@ -888,7 +888,7 @@ export const CursorOAuthPlugin = async ({
       {
         label: "OAuth with Cursor",
         type: "oauth",
-        authorize: async () => {
+        authorize: async (_inputs?: Record<string, string>) => {
           console.log("\n=== Cursor OAuth Setup ===");
           console.log(
             "1. You'll be asked to sign in to your Cursor account."
@@ -956,7 +956,6 @@ export const CursorOAuthPlugin = async ({
         },
       },
       {
-        provider: CURSOR_PROVIDER_ID,
         label: "Manually enter API Key",
         type: "api",
       },
