@@ -11,6 +11,19 @@
 >
 > If it stops working, feel free to open an issue, but fixes depend on community contributions and reverse-engineering efforts.
 
+> **⚖️ Legal Disclaimer**
+>
+> This project may violate [Cursor's Terms of Service](https://www.cursor.com/terms-of-service), specifically:
+> - **Section 1.5(i)**: Prohibits reverse engineering or deriving the underlying structure of the Service
+> - **Section 1.5(viii)**: Prohibits extracting data from the Service
+>
+> **Potential consequences include:**
+> - Your Cursor account being suspended or terminated
+> - Loss of access to Cursor services
+> - Possible legal action (cease & desist, etc.)
+>
+> **By using this project, you acknowledge these risks and accept full responsibility.** This project is provided for educational and research purposes. The authors are not responsible for any consequences of using this software.
+
 An OpenCode plugin that enables using Cursor's AI backend with OpenCode, featuring OAuth authentication, dynamic model discovery, and full tool calling support.
 
 > **📦 Package Not Yet Published**
