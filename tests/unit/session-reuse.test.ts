@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { ExecRequest } from "./api/agent-service";
+import type { ExecRequest } from "../../src/lib/api/agent-service";
 import {
   cleanupExpiredSessions,
   collectToolMessages,
@@ -11,7 +11,7 @@ import {
   selectCallBase,
   sendToolResultsToCursor,
   type SessionLike,
-} from "./session-reuse";
+} from "../../src/lib/session-reuse";
 
 function makeIterator(onReturn: () => void): AsyncIterator<any> {
   return {

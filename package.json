@@ -42,7 +42,9 @@
     "demo:login": "bun run scripts/auth-demo.ts login",
     "demo:logout": "bun run scripts/auth-demo.ts logout",
     "models": "bun run scripts/fetch-models.ts",
-    "test": "bun test"
+    "test": "bun test tests/unit",
+    "test:integration": "bun test tests/integration",
+    "test:all": "bun test tests"
   },
   "keywords": [
     "cursor",
