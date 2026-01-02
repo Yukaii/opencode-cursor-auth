@@ -57,6 +57,8 @@ import {
   encodeUserMessage,
   encodeUserMessageAction,
   encodeConversationAction,
+  encodeConversationActionWithResume,
+  encodeAgentClientMessageWithConversationAction,
   encodeModelDetails,
   encodeAgentRunRequest,
   encodeAgentClientMessage,
@@ -530,6 +532,27 @@ export class AgentServiceClient {
     this.currentAppendSeqno++;
 
     debugLog("[DEBUG] Stream close sent for exec id:", id);
+  }
+
+  /**
+   * Send a ResumeAction to signal the server to continue after tool results
+   * Based on Cursor CLI analysis: after sending tool results, send ConversationAction with resume_action
+   * to tell the server to resume streaming instead of storing responses in KV blobs
+   */
+  async sendResumeAction(): Promise<void> {
+    if (!this.currentRequestId) {
+      throw new Error("No active chat stream - cannot send resume action");
+    }
+
+    debugLog("[DEBUG] Sending ResumeAction to continue session");
+
+    const conversationAction = encodeConversationActionWithResume();
+    const agentClientMessage = encodeAgentClientMessageWithConversationAction(conversationAction);
+
+    await this.bidiAppend(this.currentRequestId, this.currentAppendSeqno, agentClientMessage);
+    this.currentAppendSeqno++;
+
+    debugLog("[DEBUG] ResumeAction sent, new seqno:", this.currentAppendSeqno);
   }
 
   /**

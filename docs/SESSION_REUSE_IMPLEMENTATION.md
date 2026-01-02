@@ -1,7 +1,7 @@
 # Session Reuse Implementation Guide
 
-**Date**: December 10, 2025  
-**Status**: Planning / Reference Documentation
+**Date**: January 1, 2026  
+**Status**: In Progress - ResumeAction encoding implemented
 
 ## Overview
 
@@ -20,7 +20,65 @@ This document outlines how to implement session reuse for the Cursor proxy, base
 - When tool results are sent via `BidiAppend` to continue a session, Cursor stores the model's response in **KV blobs** instead of streaming
 - The stream only emits heartbeats after tool completion
 - Text response is stored in blob, `turn_ended` never arrives via stream
-- **Root cause**: Unknown - possibly different client headers or protocol behavior expected
+- **Root cause**: Missing `ResumeAction` after tool result submission
+
+## Recent Progress (January 2026)
+
+### ResumeAction Discovery
+
+Analysis of `cursor-agent-restored-source-code/agent-client/dist/connect.js` (lines 486-497) revealed that after sending tool results, the Cursor CLI sends a `ConversationAction` with `resumeAction` to signal the server to continue:
+
+```javascript
+const resumeActionMessage = new agent_pb.ConversationAction({
+  action: {
+    case: "resumeAction",
+    value: new agent_pb.ResumeAction()
+  }
+});
+```
+
+### Implementation Completed
+
+1. **Unit Tests** (`tests/unit/bidi-encoding.test.ts`):
+   - Tests for `encodeBidiRequestId()`
+   - Tests for `encodeBidiAppendRequest()`
+   - Tests for `encodeResumeAction()`, `encodeConversationActionWithResume()`, `encodeAgentClientMessageWithConversationAction()`
+
+2. **Proto Encoding** (`src/lib/api/proto/agent-messages.ts`):
+   - `encodeResumeAction()` - encodes empty ResumeAction message
+   - `encodeConversationActionWithResume()` - wraps ResumeAction in ConversationAction field 2
+   - `encodeAgentClientMessageWithConversationAction()` - wraps in AgentClientMessage field 4
+
+3. **AgentServiceClient** (`src/lib/api/agent-service.ts`):
+   - Added `sendResumeAction()` method to send ResumeAction after tool results
+
+### Proto Structure Reference
+
+```
+AgentClientMessage (to server):
+  field 1: run_request (AgentRunRequest) - initial request
+  field 2: exec_client_message (ExecClientMessage) - tool results
+  field 4: conversation_action (ConversationAction) - actions like resume
+
+ConversationAction:
+  field 1: user_message_action (UserMessageAction) - for new user messages
+  field 2: resume_action (ResumeAction) - signal to continue after tool results
+
+ResumeAction:
+  (empty message - presence signals resume)
+```
+
+### Expected Wire Format
+
+For a ResumeAction message:
+```
+AgentClientMessage { conversation_action: ConversationAction { resume_action: ResumeAction {} } }
+Hex: 22 02 12 00
+  22 = field 4, wire type 2 (AgentClientMessage.conversation_action)
+  02 = length 2
+  12 = field 2, wire type 2 (ConversationAction.resume_action)
+  00 = length 0 (empty ResumeAction)
+```
 
 ## Cursor CLI Architecture Reference
 
@@ -275,12 +333,20 @@ Hypothesis: The Cursor server may use different response modes based on:
 1. **Enable flag**: `CURSOR_SESSION_REUSE=1 bun run src/server.ts`
 2. **Make request with tools**: Should get `tool_calls`, session stays open
 3. **Send tool result**: Via session continuation (BidiAppend)
-4. **Observe**: Does text stream or go to KV blob?
-5. **Extract if needed**: If KV blob, extract and emit
+4. **Send ResumeAction**: After tool result, call `client.sendResumeAction()`
+5. **Observe**: Does text stream instead of going to KV blob?
+6. **Extract if needed**: If KV blob, extract and emit
+
+## Next Steps
+
+1. **Integration**: Update the session reuse code path in `src/server.ts` or OpenCode handler to call `sendResumeAction()` after each tool result
+2. **Test with live API**: Run `CURSOR_SESSION_REUSE=1` and verify streaming resumes after ResumeAction
+3. **Handle edge cases**: Multiple tool calls in sequence, timeouts, connection loss
 
 ## References
 
 - Cursor CLI source: `cursor-agent-restored-source-code/`
 - Our implementation: `src/server.ts`, `src/lib/api/agent-service.ts`
 - KV handling: `src/lib/api/agent-service.ts:handleKvMessage()`
-- Session reuse (deprecated): `src/server.ts:streamWithSessionReuse()`
+- ResumeAction encoding: `src/lib/api/proto/agent-messages.ts`
+- Unit tests: `tests/unit/bidi-encoding.test.ts`

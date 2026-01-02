@@ -93,6 +93,19 @@ export function encodeConversationAction(userMessageAction: Uint8Array): Uint8Ar
   return encodeMessageField(1, userMessageAction);
 }
 
+export function encodeResumeAction(): Uint8Array {
+  return new Uint8Array(0);
+}
+
+export function encodeConversationActionWithResume(): Uint8Array {
+  const resumeAction = encodeResumeAction();
+  return encodeMessageField(2, resumeAction);
+}
+
+export function encodeAgentClientMessageWithConversationAction(conversationAction: Uint8Array): Uint8Array {
+  return encodeMessageField(4, conversationAction);
+}
+
 export function encodeModelDetails(modelId: string): Uint8Array {
   return encodeStringField(1, modelId);
 }
