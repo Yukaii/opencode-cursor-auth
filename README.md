@@ -1,5 +1,9 @@
 # OpenCode Cursor Auth
 
+> **💡 Alternative Available**
+>
+> Check out [opencode-cursor-auth](https://github.com/POSO-PocketSolutions/opencode-cursor-auth) by POSO-PocketSolutions - another implementation you may want to consider.
+
 > **⚠️ Experimental Project - Use at Your Own Risk**
 >
 > This is a highly experimental project with limited support. It integrates with Cursor services via an unofficial interface, which means:
