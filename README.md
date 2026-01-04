@@ -23,12 +23,6 @@
 
 An OpenCode plugin that enables using Cursor's AI backend with OpenCode, featuring OAuth authentication, dynamic model discovery, and full tool calling support.
 
-> **📦 Package Not Yet Published**
->
-> The npm package `yet-another-opencode-cursor-auth` is not yet published to npm. For now, you'll need to:
-> - Clone this repository and use local development setup, or
-> - Reference the GitHub repository directly in your dependencies
-
 ## Features
 
 - **OpenCode Plugin**: Native integration with OpenCode via OAuth authentication
@@ -38,51 +32,16 @@ An OpenCode plugin that enables using Cursor's AI backend with OpenCode, featuri
 
 ## Quick Start with OpenCode
 
-### Option 1: Local Development Setup (Recommended for now)
+### 1. Configure OpenCode
 
-Since the npm package isn't published yet, clone and link locally:
-
-```bash
-# Clone the repository
-git clone https://github.com/Yukaii/yet-another-opencode-cursor-auth.git
-cd yet-another-opencode-cursor-auth
-bun install
-
-# Link for local development
-bun link
-```
-
-Then in your project:
-
-```bash
-bun link yet-another-opencode-cursor-auth
-```
-
-### Option 2: GitHub Dependency
-
-Add directly from GitHub in your `package.json`:
-
-```json
-{
-  "dependencies": {
-    "yet-another-opencode-cursor-auth": "github:Yukaii/yet-another-opencode-cursor-auth"
-  }
-}
-```
-
-### Configure OpenCode
-
-Create `.opencode/plugins/cursor-auth.ts`:
-
-```typescript
-export { CursorOAuthPlugin } from "yet-another-opencode-cursor-auth";
-```
-
-Add to your `opencode.json`:
+Add the plugin and Cursor provider to your `opencode.json`:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "yet-another-opencode-cursor-auth"
+  ],
   "provider": {
     "cursor": {
       "name": "Cursor"
@@ -91,16 +50,11 @@ Add to your `opencode.json`:
 }
 ```
 
-That's it! The plugin will:
-- Handle OAuth authentication with Cursor
-- Automatically discover and register all available models
-- Provide a custom fetch handler (no proxy server needed)
-
-### Authenticate
+### 2. Authenticate
 
 Run OpenCode and authenticate:
 
-```
+```bash
 opencode auth login
 ```
 
@@ -109,6 +63,11 @@ Then:
 2. Type **"cursor"** as the provider name
 3. Select **"OAuth with Cursor"**
 4. Complete the browser-based OAuth flow
+
+That's it! The plugin will:
+- Handle OAuth authentication with Cursor
+- Automatically discover and register all available models
+- Provide a custom fetch handler (no proxy server needed)
 
 ## Available Models
 
