@@ -30,6 +30,7 @@ describe("Agent Service Tool Calling Integration", () => {
 
       const chunkTypes = new Set<string>();
       let textContent = "";
+      let errorText = "";
 
       const promise = (async () => {
         for await (const chunk of client.chatStream({
@@ -65,7 +66,9 @@ describe("Agent Service Tool Calling Integration", () => {
           }
 
           if (chunk.type === "error") {
-            console.log(`⚠️  Error: ${chunk.error}`);
+            errorText = chunk.error ?? "Unknown error";
+            console.log(`⚠️  Error: ${errorText}`);
+            break;
           }
         }
       })();
@@ -74,6 +77,14 @@ describe("Agent Service Tool Calling Integration", () => {
 
       console.log(`   Chunk types seen: [${Array.from(chunkTypes).join(", ")}]`);
       console.log(`   Text received: ${textContent.length} chars`);
+
+      if (
+        errorText.toLowerCase().includes("monthly limit") ||
+        errorText.includes("grpc-status 8")
+      ) {
+        console.log("⏭️  Skipping: Cursor usage limit reached");
+        return;
+      }
 
       expect(chunkTypes.size).toBeGreaterThan(0);
       expect(chunkTypes.has("text") || chunkTypes.has("done")).toBe(true);
@@ -87,6 +98,7 @@ describe("Agent Service Tool Calling Integration", () => {
 
       let textContent = "";
       let execRequestCount = 0;
+      let errorText = "";
 
       const promise = (async () => {
         for await (const chunk of client.chatStream({
@@ -101,7 +113,9 @@ describe("Agent Service Tool Calling Integration", () => {
             execRequestCount++;
           }
           if (chunk.type === "error") {
-            console.log(`⚠️  Error: ${chunk.error}`);
+            errorText = chunk.error ?? "Unknown error";
+            console.log(`⚠️  Error: ${errorText}`);
+            break;
           }
         }
       })();
@@ -109,6 +123,15 @@ describe("Agent Service Tool Calling Integration", () => {
       await withTimeout(promise, TOOL_TEST_TIMEOUT, "ASK mode test timed out");
 
       console.log(`   Text: ${textContent.length} chars, Exec requests: ${execRequestCount}`);
+
+      const errorMessage = errorText ?? "";
+      if (
+        errorMessage.toLowerCase().includes("monthly limit") ||
+        errorMessage.includes("grpc-status 8")
+      ) {
+        console.log("⏭️  Skipping: Cursor usage limit reached");
+        return;
+      }
 
       expect(textContent.length).toBeGreaterThan(0);
     }, TOOL_TEST_TIMEOUT);

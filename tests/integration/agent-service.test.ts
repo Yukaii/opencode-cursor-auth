@@ -28,11 +28,22 @@ describe("Agent Service Integration", () => {
         return;
       }
 
-      const response = await withTimeout(
-        collectStreamText(client, "Reply with exactly: hello world"),
-        INTEGRATION_TEST_TIMEOUT,
-        "Chat streaming timed out"
-      );
+      let response: string;
+
+      try {
+        response = await withTimeout(
+          collectStreamText(client, "Reply with exactly: hello world"),
+          INTEGRATION_TEST_TIMEOUT,
+          "Chat streaming timed out"
+        );
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.toLowerCase().includes("monthly limit") || message.includes("grpc-status 8")) {
+          console.log("⏭️  Skipping: Cursor usage limit reached");
+          return;
+        }
+        throw err;
+      }
 
       expect(response.length).toBeGreaterThan(0);
       expect(response.toLowerCase()).toContain("hello");
@@ -45,17 +56,27 @@ describe("Agent Service Integration", () => {
       }
 
       let textReceived = "";
-      for await (const chunk of client.chatStream({
-        message: "What is 2+2? Reply with just the number.",
-        model: DEFAULT_TEST_MODEL,
-        mode: AgentMode.ASK,
-      })) {
-        if (chunk.type === "text" && chunk.content) {
-          textReceived += chunk.content;
+
+      try {
+        for await (const chunk of client.chatStream({
+          message: "What is 2+2? Reply with just the number.",
+          model: DEFAULT_TEST_MODEL,
+          mode: AgentMode.ASK,
+        })) {
+          if (chunk.type === "text" && chunk.content) {
+            textReceived += chunk.content;
+          }
+          if (chunk.type === "error") {
+            throw new Error(chunk.error ?? "Unknown error");
+          }
         }
-        if (chunk.type === "error") {
-          throw new Error(chunk.error ?? "Unknown error");
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.toLowerCase().includes("monthly limit") || message.includes("grpc-status 8")) {
+          console.log("⏭️  Skipping: Cursor usage limit reached");
+          return;
         }
+        throw err;
       }
 
       expect(textReceived).toContain("4");
@@ -67,14 +88,25 @@ describe("Agent Service Integration", () => {
         return;
       }
 
-      const response = await withTimeout(
-        collectStreamText(
-          client,
-          "Write a haiku about code. Format it with line breaks."
-        ),
-        INTEGRATION_TEST_TIMEOUT,
-        "Multi-line streaming timed out"
-      );
+      let response: string;
+
+      try {
+        response = await withTimeout(
+          collectStreamText(
+            client,
+            "Write a haiku about code. Format it with line breaks."
+          ),
+          INTEGRATION_TEST_TIMEOUT,
+          "Multi-line streaming timed out"
+        );
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        if (message.toLowerCase().includes("monthly limit") || message.includes("grpc-status 8")) {
+          console.log("⏭️  Skipping: Cursor usage limit reached");
+          return;
+        }
+        throw err;
+      }
 
       expect(response.length).toBeGreaterThan(10);
       expect(response.split(/\n/).length).toBeGreaterThanOrEqual(1);
@@ -114,7 +146,7 @@ describe("Agent Service Integration", () => {
   });
 
   describe("different models", () => {
-    const modelsToTest = ["gpt-4o-mini", "claude-3.5-sonnet"];
+    const modelsToTest = ["gpt-5.1", "claude-4.5-sonnet"];
 
     for (const modelId of modelsToTest) {
       test(`works with model: ${modelId}`, async () => {

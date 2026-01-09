@@ -32,6 +32,9 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { readdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { generateChecksum, addConnectEnvelope } from "./cursor-client";
 import {
   encodeMessageField,
@@ -133,6 +136,98 @@ export const CURSOR_API_URL = "https://api2.cursor.sh";
 export const AGENT_PRIVACY_URL = "https://agent.api5.cursor.sh";
 export const AGENT_NON_PRIVACY_URL = "https://agentn.api5.cursor.sh";
 
+function detectLatestInstalledAgentVersion(): string | undefined {
+  try {
+    const versionsDir = join(homedir(), ".local", "share", "cursor-agent", "versions");
+    const entries = readdirSync(versionsDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name)
+      .sort();
+
+    const latest = entries.at(-1);
+    return latest ? `cli-${latest}` : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveClientVersionHeader(): string {
+  return process.env.CURSOR_CLIENT_VERSION ?? detectLatestInstalledAgentVersion() ?? "cli-unknown";
+}
+
+function parseTrailerMetadata(trailer: string): Record<string, string> {
+  const meta: Record<string, string> = {};
+
+  for (const rawLine of trailer.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const idx = line.indexOf(":");
+    if (idx === -1) continue;
+
+    const key = line.slice(0, idx).trim().toLowerCase();
+    const value = line.slice(idx + 1).trim();
+    if (!key) continue;
+    meta[key] = value;
+  }
+
+  return meta;
+}
+
+function decodeGrpcStatusDetailsBin(detailsB64: string): string | undefined {
+  try {
+    const decoded = Buffer.from(detailsB64.trim(), "base64");
+    const statusFields = parseProtoFields(decoded);
+
+    let statusMessage: string | undefined;
+    const extracted: string[] = [];
+
+    const collectStrings = (bytes: Uint8Array, depth: number): void => {
+      if (depth > 5) return;
+      if (bytes.length === 0 || bytes.length > 20000) return;
+
+      for (const pf of parseProtoFields(bytes)) {
+        if (pf.wireType === 2 && pf.value instanceof Uint8Array) {
+          const maybeText = new TextDecoder().decode(pf.value).trim();
+          if (
+            maybeText.length >= 6 &&
+            /[A-Za-z]/.test(maybeText) &&
+            !maybeText.includes("\u0000")
+          ) {
+            extracted.push(maybeText);
+          }
+          collectStrings(pf.value, depth + 1);
+        }
+      }
+    };
+
+    for (const field of statusFields) {
+      // google.rpc.Status.message = field 2
+      if (field.fieldNumber === 2 && field.wireType === 2 && field.value instanceof Uint8Array) {
+        const text = new TextDecoder().decode(field.value).trim();
+        if (text) statusMessage = text;
+      }
+
+      // google.rpc.Status.details (repeated Any) = field 3
+      if (field.fieldNumber === 3 && field.wireType === 2 && field.value instanceof Uint8Array) {
+        const anyFields = parseProtoFields(field.value);
+        const valueField = anyFields.find((f) => f.fieldNumber === 2 && f.wireType === 2);
+        if (!valueField || !(valueField.value instanceof Uint8Array)) continue;
+
+        // Try to extract human-readable strings from the Any.value payload
+        collectStrings(valueField.value, 0);
+      }
+    }
+
+    const unique = Array.from(new Set(extracted));
+    const details = unique.length > 0 ? unique.join(" | ") : undefined;
+
+    if (details && statusMessage) return `${statusMessage} | ${details}`;
+    return details ?? statusMessage;
+  } catch {
+    return undefined;
+  }
+}
+
 // --- Types are now imported from ./proto ---
 // ExecRequest types, ToolCallInfo, AgentStreamChunk, AgentServiceOptions, AgentChatRequest
 // are all imported from ./proto/types via the barrel export
@@ -151,6 +246,9 @@ export class AgentServiceClient {
   private accessToken: string;
   private workspacePath: string;
   private blobStore: Map<string, Uint8Array>;
+  private privacyMode = true;
+  private clientVersionHeader = "cli-unknown";
+  private baseUrlAttempts: string[] | null = null;
 
   // For tool result submission during streaming
   private currentRequestId: string | null = null;
@@ -162,11 +260,17 @@ export class AgentServiceClient {
 
   constructor(accessToken: string, options: AgentServiceOptions = {}) {
     this.accessToken = accessToken;
-    // Use main API endpoint (api2.cursor.sh) - agent.api5.cursor.sh requires feature flag
+    this.privacyMode = options.privacyMode ?? true;
+    this.clientVersionHeader = resolveClientVersionHeader();
+
+    // Default to api2, but allow fallback to agent backends if needed
     this.baseUrl = options.baseUrl ?? CURSOR_API_URL;
     this.workspacePath = options.workspacePath ?? process.cwd();
     this.blobStore = new Map();
-    debugLog(`[DEBUG] AgentServiceClient using baseUrl: ${this.baseUrl}`);
+
+    debugLog(
+      `[DEBUG] AgentServiceClient using baseUrl: ${this.baseUrl}, privacyMode=${this.privacyMode}, clientVersion=${this.clientVersionHeader}`
+    );
   }
 
   private getHeaders(requestId?: string): Record<string, string> {
@@ -177,10 +281,10 @@ export class AgentServiceClient {
       "content-type": "application/grpc-web+proto",
       "user-agent": "connect-es/1.4.0",
       "x-cursor-checksum": checksum,
-      "x-cursor-client-version": "cli-2025.11.25-d5b3271",
+      "x-cursor-client-version": this.clientVersionHeader,
       "x-cursor-client-type": "cli",
       "x-cursor-timezone": Intl.DateTimeFormat().resolvedOptions().timeZone,
-      "x-ghost-mode": "false",
+      "x-ghost-mode": this.privacyMode ? "true" : "false",
       // Signal to backend that we can receive SSE text/event-stream responses
       // Without this, server may store responses in KV blobs instead of streaming
       "x-cursor-streaming": "true",
@@ -191,6 +295,38 @@ export class AgentServiceClient {
     }
 
     return headers;
+  }
+
+  private getBaseUrlAttempts(): string[] {
+    if (this.baseUrlAttempts) return this.baseUrlAttempts;
+
+    const orderedCandidates: string[] = [this.baseUrl];
+
+    // Cursor can route AgentService/BidiService to agent.api5.cursor.sh, but those
+    // backends often require HTTP/2. Bun's fetch currently struggles with that,
+    // so only attempt api5 fallbacks when explicitly enabled.
+    const allowApi5Fallback = process.env.CURSOR_AGENT_TRY_API5 === "1";
+    const isBunRuntime =
+      typeof (globalThis as { Bun?: unknown }).Bun !== "undefined";
+
+    if (allowApi5Fallback && !isBunRuntime) {
+      if (this.baseUrl === CURSOR_API_URL) {
+        orderedCandidates.push(
+          this.privacyMode ? AGENT_PRIVACY_URL : AGENT_NON_PRIVACY_URL
+        );
+        orderedCandidates.push(
+          this.privacyMode ? AGENT_NON_PRIVACY_URL : AGENT_PRIVACY_URL
+        );
+      } else if (
+        this.baseUrl === AGENT_PRIVACY_URL ||
+        this.baseUrl === AGENT_NON_PRIVACY_URL
+      ) {
+        orderedCandidates.push(CURSOR_API_URL);
+      }
+    }
+
+    this.baseUrlAttempts = Array.from(new Set(orderedCandidates));
+    return this.baseUrlAttempts;
   }
 
   private blobIdToKey(blobId: Uint8Array): string {
@@ -567,9 +703,66 @@ export class AgentServiceClient {
   }
 
   /**
-   * Send a streaming chat request using BidiSse pattern
+   * Send a streaming chat request.
+   *
+   * Cursor periodically migrates AgentService/BidiService to different backends.
+   * If a request fails before any meaningful output, retry against known agent
+   * backends before surfacing the error.
    */
   async *chatStream(request: AgentChatRequest): AsyncGenerator<AgentStreamChunkType> {
+    const baseUrlAttempts = this.getBaseUrlAttempts();
+    let lastError: AgentStreamChunkType | null = null;
+
+    for (let attemptIndex = 0; attemptIndex < baseUrlAttempts.length; attemptIndex++) {
+      const baseUrl = baseUrlAttempts[attemptIndex] ?? this.baseUrl;
+      this.baseUrl = baseUrl;
+
+      let sawMeaningfulOutput = false;
+      let shouldRetry = false;
+
+      for await (const chunk of this.chatStreamOnce(request)) {
+        if (chunk.type === "error") {
+          lastError = chunk;
+          if (!sawMeaningfulOutput && attemptIndex < baseUrlAttempts.length - 1) {
+            debugLog(
+              `[DEBUG] chatStream retrying with next baseUrl after error: ${chunk.error}`
+            );
+            shouldRetry = true;
+            break;
+          }
+
+          yield chunk;
+          return;
+        }
+
+        if (
+          chunk.type === "text" ||
+          chunk.type === "exec_request" ||
+          chunk.type === "tool_call_started" ||
+          chunk.type === "tool_call_completed" ||
+          chunk.type === "partial_tool_call" ||
+          chunk.type === "interaction_query" ||
+          chunk.type === "kv_blob_assistant"
+        ) {
+          sawMeaningfulOutput = true;
+        }
+
+        yield chunk;
+      }
+
+      if (!shouldRetry) return;
+    }
+
+    if (lastError) {
+      yield lastError;
+    } else {
+      yield { type: "error", error: "Unknown error" };
+    }
+  }
+
+  private async *chatStreamOnce(
+    request: AgentChatRequest
+  ): AsyncGenerator<AgentStreamChunkType> {
     const metrics = createTimingMetrics();
     const requestId = randomUUID();
 
@@ -621,7 +814,9 @@ export class AgentServiceClient {
       const sseResponse = await ssePromise;
       metrics.sseConnectionMs = Date.now() - metrics.requestStart;
 
-      debugLog(`[TIMING] Request sent: build=${metrics.messageBuildMs}ms, append=${metrics.firstBidiAppendMs}ms, response=${metrics.sseConnectionMs}ms`);
+      debugLog(
+        `[TIMING] Request sent: build=${metrics.messageBuildMs}ms, append=${metrics.firstBidiAppendMs}ms, response=${metrics.sseConnectionMs}ms`
+      );
 
       if (!sseResponse.ok) {
         clearTimeout(timeout);
@@ -685,11 +880,25 @@ export class AgentServiceClient {
             if ((flags ?? 0) & 0x80) {
               const trailer = new TextDecoder().decode(frameData);
               debugLog("Received trailer frame:", trailer.slice(0, 200));
-              if (trailer.includes("grpc-status:") && !trailer.includes("grpc-status: 0")) {
-                const match = trailer.match(/grpc-message:\s*([^\r\n]+)/);
-                const errorMsg = decodeURIComponent(match?.[1] ?? "Unknown gRPC error");
-                console.error("gRPC error:", errorMsg);
-                yield { type: "error", error: errorMsg };
+              const meta = parseTrailerMetadata(trailer);
+              const grpcStatus = Number(meta["grpc-status"] ?? "0");
+
+              if (grpcStatus !== 0) {
+                const grpcMessage = meta["grpc-message"]
+                  ? decodeURIComponent(meta["grpc-message"])
+                  : "Unknown gRPC error";
+
+                const detailsBin = meta["grpc-status-details-bin"];
+                const decodedDetails = detailsBin
+                  ? decodeGrpcStatusDetailsBin(detailsBin)
+                  : undefined;
+
+                const fullError = decodedDetails
+                  ? `${grpcMessage} (grpc-status ${grpcStatus}): ${decodedDetails}`
+                  : `${grpcMessage} (grpc-status ${grpcStatus})`;
+
+                console.error("gRPC error:", fullError);
+                yield { type: "error", error: fullError };
               }
               continue;
             }

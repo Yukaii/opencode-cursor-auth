@@ -6,7 +6,7 @@ import {
 } from "../src/lib/api/agent-service";
 
 export const INTEGRATION_TEST_TIMEOUT = 60000;
-export const DEFAULT_TEST_MODEL = "gpt-4o-mini";
+export const DEFAULT_TEST_MODEL = "default";
 
 export async function hasValidCredentials(): Promise<boolean> {
   const cm = new FileCredentialManager("cursor");
