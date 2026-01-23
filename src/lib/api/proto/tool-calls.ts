@@ -107,6 +107,11 @@ export function parseToolCall(data: Uint8Array): ParsedToolCall {
     }
   }
 
+  // Ensure bash tool calls have a description (required by OpenCode)
+  if (name === "bash" && !args.description) {
+    args.description = "Execute shell command";
+  }
+
   return { toolType, name, arguments: args };
 }
 
