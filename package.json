@@ -28,7 +28,7 @@
     }
   },
   "scripts": {
-    "prepare": "rm -rf dist && bun x tsc -p tsconfig.build.json --skipLibCheck",
+    "prepare": "rm -rf dist && bun x tsc -p tsconfig.build.json",
     "build": "rm -rf dist && bun x tsc -p tsconfig.build.json",
     "start": "bun run src/server.ts",
     "server": "bun run src/server.ts",
