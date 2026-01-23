@@ -28,6 +28,7 @@
     }
   },
   "scripts": {
+    "prepare": "bun run build",
     "build": "rm -rf dist && bun x tsc -p tsconfig.build.json",
     "start": "bun run src/server.ts",
     "server": "bun run src/server.ts",
